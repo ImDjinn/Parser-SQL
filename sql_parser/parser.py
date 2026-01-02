@@ -2,10 +2,12 @@
 Parser SQL - Analyseur syntaxique.
 
 Convertit une séquence de tokens en un AST (Abstract Syntax Tree).
+Supporte plusieurs dialectes SQL: Standard, Presto, Athena, Trino.
 """
 
 from typing import List, Optional, Union, Set
 from .tokenizer import SQLTokenizer, Token, TokenType
+from .dialects import SQLDialect, get_dialect_features, detect_dialect
 from .ast_nodes import (
     Expression, Literal, Identifier, ColumnRef, Star, Parameter,
     BinaryOp, UnaryOp, FunctionCall, CaseExpression,
@@ -13,7 +15,11 @@ from .ast_nodes import (
     ExistsExpression, SubqueryExpression, CastExpression,
     SelectItem, TableRef, SubqueryRef, JoinClause, FromClause,
     JoinType, OrderDirection, SetOperationType, OrderByItem,
-    CTEDefinition, SelectStatement, ParseInfo, ParseResult
+    CTEDefinition, SelectStatement, ParseInfo, ParseResult,
+    # Presto/Athena specific
+    ArrayExpression, MapExpression, RowExpression, ArraySubscript,
+    LambdaExpression, IntervalExpression, AtTimeZone, TryExpression,
+    IfExpression, JinjaExpression, WindowFunction, UnnestRef, TableSample
 )
 
 
@@ -31,9 +37,24 @@ class SQLParser:
     """Parser SQL qui construit un AST à partir de tokens."""
     
     # Fonctions d'agrégation connues
-    AGGREGATE_FUNCTIONS = {'count', 'sum', 'avg', 'min', 'max', 'group_concat', 'string_agg'}
+    AGGREGATE_FUNCTIONS = {
+        'count', 'sum', 'avg', 'min', 'max', 'group_concat', 'string_agg',
+        # Presto/Athena
+        'approx_distinct', 'approx_percentile', 'arbitrary', 'array_agg',
+        'bool_and', 'bool_or', 'checksum', 'count_if', 'every',
+        'geometric_mean', 'histogram', 'map_agg', 'map_union',
+        'max_by', 'min_by', 'multimap_agg'
+    }
     
-    def __init__(self):
+    def __init__(self, dialect: SQLDialect = None):
+        """
+        Initialise le parser.
+        
+        Args:
+            dialect: Dialecte SQL à utiliser. Si None, auto-détection.
+        """
+        self.dialect = dialect
+        self.dialect_features = None
         self.tokens: List[Token] = []
         self.pos: int = 0
         self.original_sql: str = ""
@@ -46,6 +67,7 @@ class SQLParser:
         self.has_aggregation: bool = False
         self.has_subquery: bool = False
         self.has_join: bool = False
+        self.has_jinja: bool = False
     
     def _reset(self):
         """Réinitialise l'état du parser."""
@@ -57,6 +79,7 @@ class SQLParser:
         self.has_aggregation = False
         self.has_subquery = False
         self.has_join = False
+        self.has_jinja = False
     
     def _current(self) -> Token:
         """Retourne le token courant."""
@@ -117,6 +140,11 @@ class SQLParser:
         tokenizer = SQLTokenizer(sql, include_whitespace=False, include_comments=False)
         self.tokens = tokenizer.tokenize()
         
+        # Auto-détection du dialecte si non spécifié
+        if self.dialect is None:
+            self.dialect = detect_dialect(sql)
+        self.dialect_features = get_dialect_features(self.dialect)
+        
         # Parsing
         statement = self._parse_statement()
         
@@ -127,7 +155,7 @@ class SQLParser:
             implicit_info=self._extract_implicit_info(statement)
         )
         
-        return ParseResult(
+        result = ParseResult(
             statement=statement,
             parse_info=parse_info,
             tables_referenced=list(self.tables_referenced),
@@ -137,6 +165,13 @@ class SQLParser:
             has_subquery=self.has_subquery,
             has_join=self.has_join
         )
+        
+        # Ajout des métadonnées de dialecte
+        result.parse_info.implicit_info["dialect"] = self.dialect.value
+        if self.has_jinja:
+            result.parse_info.implicit_info["has_jinja_templates"] = True
+        
+        return result
     
     def _extract_implicit_info(self, statement: SelectStatement) -> dict:
         """Extrait les informations implicites de la requête."""
@@ -165,6 +200,14 @@ class SQLParser:
     
     def _parse_statement(self) -> SelectStatement:
         """Parse un statement SQL (pour l'instant, uniquement SELECT)."""
+        # Consommer les templates Jinja de configuration au début (dbt)
+        jinja_config = []
+        while self._match(TokenType.JINJA_EXPR, TokenType.JINJA_STMT, TokenType.JINJA_COMMENT):
+            token = self._advance()
+            if token.type in (TokenType.JINJA_EXPR, TokenType.JINJA_STMT):
+                jinja_config.append(token.value)
+            self.has_jinja = True
+        
         # Gestion des CTE (WITH clause)
         ctes = None
         if self._check(TokenType.WITH):
@@ -173,6 +216,10 @@ class SQLParser:
         if self._check(TokenType.SELECT):
             statement = self._parse_select()
             statement.ctes = ctes
+            # Stocker les configurations Jinja comme métadonnées
+            if jinja_config:
+                statement.metadata = statement.metadata or {}
+                statement.metadata["jinja_config"] = jinja_config
             return statement
         else:
             raise SQLParserError("Expected SELECT statement", self._current())
@@ -399,8 +446,18 @@ class SQLParser:
         
         return FromClause(tables=tables)
     
-    def _parse_table_ref(self) -> Union[TableRef, SubqueryRef]:
-        """Parse une référence de table ou sous-requête."""
+    def _parse_table_ref(self) -> Union[TableRef, SubqueryRef, UnnestRef]:
+        """Parse une référence de table, sous-requête, ou UNNEST."""
+        
+        # UNNEST (Presto/Athena)
+        if self._check(TokenType.UNNEST):
+            return self._parse_unnest_ref()
+        
+        # LATERAL (Presto/Athena)
+        if self._check(TokenType.LATERAL):
+            self._advance()
+            return self._parse_table_ref()
+        
         # Sous-requête
         if self._check(TokenType.LPAREN):
             self._advance()
@@ -422,6 +479,24 @@ class SQLParser:
                 return SubqueryRef(query=query, alias=alias)
             else:
                 raise SQLParserError("Expected SELECT in subquery", self._current())
+        
+        # Template Jinja comme référence de table (dbt: {{ ref('...') }}, {{ source(...) }})
+        if self._match(TokenType.JINJA_EXPR, TokenType.JINJA_STMT):
+            jinja_token = self._advance()
+            self.has_jinja = True
+            
+            # Traiter comme une référence de table avec le template comme nom
+            name = jinja_token.value
+            self.tables_referenced.add(name)
+            
+            # Alias optionnel
+            alias = None
+            if self._consume_if(TokenType.AS):
+                alias = self._expect(TokenType.IDENTIFIER, "Expected alias").value
+            elif self._check(TokenType.IDENTIFIER) and not self._is_keyword(self._current()):
+                alias = self._advance().value
+            
+            return TableRef(name=name, alias=alias, schema=None, is_jinja=True)
         
         # Table normale
         # Gestion du schéma: schema.table
@@ -445,6 +520,46 @@ class SQLParser:
         
         return TableRef(name=name, alias=alias, schema=schema)
     
+    def _parse_unnest_ref(self) -> UnnestRef:
+        """Parse UNNEST(...) [WITH ORDINALITY] (Presto/Athena)."""
+        self._expect(TokenType.UNNEST)
+        self._expect(TokenType.LPAREN)
+        
+        expr = self._parse_expression()
+        
+        self._expect(TokenType.RPAREN)
+        
+        # WITH ORDINALITY
+        with_ordinality = False
+        ordinality_alias = None
+        if self._check(TokenType.WITH):
+            self._advance()
+            if self._check(TokenType.ORDINALITY):
+                self._advance()
+                with_ordinality = True
+        
+        # Alias
+        alias = None
+        self._consume_if(TokenType.AS)
+        if self._check(TokenType.IDENTIFIER):
+            alias = self._advance().value
+            
+            # Alias pour ordinality: AS t(elem, ord)
+            if self._check(TokenType.LPAREN):
+                self._advance()
+                # Ignore les noms de colonnes pour l'instant
+                while not self._check(TokenType.RPAREN):
+                    self._advance()
+                    self._consume_if(TokenType.COMMA)
+                self._expect(TokenType.RPAREN)
+        
+        return UnnestRef(
+            expression=expr,
+            alias=alias,
+            with_ordinality=with_ordinality,
+            ordinality_alias=ordinality_alias
+        )
+    
     def _is_keyword(self, token: Token) -> bool:
         """Vérifie si un token IDENTIFIER est en fait un mot-clé contextuel."""
         keywords = {
@@ -452,7 +567,7 @@ class SQLParser:
             TokenType.FULL, TokenType.OUTER, TokenType.CROSS, TokenType.NATURAL,
             TokenType.ON, TokenType.WHERE, TokenType.GROUP, TokenType.ORDER,
             TokenType.HAVING, TokenType.LIMIT, TokenType.OFFSET, TokenType.UNION,
-            TokenType.INTERSECT, TokenType.EXCEPT
+            TokenType.INTERSECT, TokenType.EXCEPT, TokenType.LATERAL, TokenType.UNNEST
         }
         return token.type in keywords
     
@@ -717,11 +832,17 @@ class SQLParser:
             operand = self._parse_unary_expression()
             return UnaryOp(operator=op_token.value, operand=operand)
         
-        return self._parse_primary_expression()
+        # Parse expression primaire puis expressions postfixes
+        expr = self._parse_primary_expression()
+        return self._parse_postfix_expression(expr)
     
     def _parse_primary_expression(self) -> Expression:
         """Parse une expression primaire."""
         token = self._current()
+        
+        # Jinja templates (dbt)
+        if self._match(TokenType.JINJA_EXPR, TokenType.JINJA_STMT, TokenType.JINJA_COMMENT):
+            return self._parse_jinja_expression()
         
         # EXISTS
         if self._consume_if(TokenType.EXISTS):
@@ -734,6 +855,48 @@ class SQLParser:
         # CASE expression
         if self._check(TokenType.CASE):
             return self._parse_case_expression()
+        
+        # ARRAY[] (Presto/Athena)
+        if self._check(TokenType.ARRAY):
+            return self._parse_array_expression()
+        
+        # MAP() (Presto/Athena)
+        if self._check(TokenType.MAP):
+            return self._parse_map_expression()
+        
+        # ROW() (Presto/Athena)
+        if self._check(TokenType.ROW):
+            return self._parse_row_expression()
+        
+        # INTERVAL (Presto/Athena)
+        if self._check(TokenType.INTERVAL):
+            return self._parse_interval_expression()
+        
+        # TRY() ou TRY_CAST() (Presto/Athena)
+        if self._check(TokenType.TRY):
+            return self._parse_try_expression()
+        
+        # IF() (Presto/Athena)
+        if self._check(TokenType.IF):
+            return self._parse_if_expression()
+        
+        # Littéraux typés: DATE 'valeur', TIMESTAMP 'valeur', TIME 'valeur'
+        if self._match(TokenType.DATE, TokenType.TIMESTAMP, TokenType.TIME):
+            type_token = self._advance()
+            type_name = type_token.value.upper()
+            
+            # Peut être suivi d'une string littérale ou d'un template Jinja
+            if self._check(TokenType.STRING):
+                raw_value = self._advance().value
+                value = raw_value[1:-1] if len(raw_value) >= 2 else raw_value
+                return Literal(value=value, literal_type=type_name.lower())
+            elif self._match(TokenType.JINJA_EXPR, TokenType.JINJA_STMT):
+                jinja_expr = self._parse_jinja_expression()
+                # Créer un CAST implicite du Jinja vers le type
+                return CastExpression(expression=jinja_expr, target_type=type_name)
+            else:
+                # DATE sans littéral - traiter comme identifiant
+                return Identifier(name=type_name)
         
         # Parenthèses ou sous-requête
         if self._consume_if(TokenType.LPAREN):
@@ -787,12 +950,31 @@ class SQLParser:
         if self._check(TokenType.IDENTIFIER) or self._check(TokenType.QUOTED_IDENTIFIER):
             return self._parse_identifier_or_function()
         
+        # Mots-clés qui peuvent être utilisés comme noms de fonction en Presto/Athena
+        # (filter, left, right, etc.) - si suivi par LPAREN
+        if self._is_callable_keyword():
+            return self._parse_identifier_or_function()
+        
         # STAR seul (dans certains contextes)
         if self._check(TokenType.STAR):
             self._advance()
             return Star()
         
         raise SQLParserError(f"Unexpected token: {token.type.name}", token)
+    
+    def _is_callable_keyword(self) -> bool:
+        """Vérifie si le token courant est un mot-clé utilisable comme fonction."""
+        # Vérifie si le token actuel est suivi par LPAREN (appel de fonction)
+        if self._peek().type != TokenType.LPAREN:
+            return False
+            
+        # Liste des mots-clés qui sont aussi des fonctions en Presto/Athena
+        callable_keywords = {
+            TokenType.FILTER,      # filter(array, x -> ...)
+            TokenType.LEFT,        # left(string, n)
+            TokenType.RIGHT,       # right(string, n)
+        }
+        return self._current().type in callable_keywords
     
     def _parse_aggregate_function(self) -> FunctionCall:
         """Parse une fonction d'agrégation."""
@@ -837,6 +1019,14 @@ class SQLParser:
             
             func_name = name.upper()
             self.functions_used.add(func_name)
+            
+            # CAST a une syntaxe spéciale: CAST(expr AS type)
+            if func_name == 'CAST':
+                expr = self._parse_expression()
+                self._expect(TokenType.AS, "Expected AS in CAST expression")
+                target_type = self._parse_type_name()
+                self._expect(TokenType.RPAREN)
+                return CastExpression(expression=expr, target_type=target_type)
             
             if func_name.lower() in self.AGGREGATE_FUNCTIONS:
                 self.has_aggregation = True
@@ -906,17 +1096,257 @@ class SQLParser:
             when_clauses=when_clauses,
             else_clause=else_clause
         )
+    
+    def _parse_type_name(self) -> str:
+        """Parse un nom de type SQL (ex: DOUBLE, VARCHAR(255), ARRAY<INT>)."""
+        # Types Presto/Athena: DOUBLE, VARCHAR, BIGINT, ARRAY<T>, MAP<K,V>, ROW(...)
+        type_parts = []
+        
+        # Nom de type principal - accepter identifiants et certains mots-clés
+        token = self._current()
+        if token.type in (TokenType.IDENTIFIER, TokenType.ARRAY, TokenType.MAP, 
+                          TokenType.ROW, TokenType.INTERVAL, TokenType.DATE,
+                          TokenType.TIMESTAMP, TokenType.TIME):
+            type_parts.append(self._advance().value.upper())
+        else:
+            # Accepter d'autres tokens comme noms de type (DOUBLE, INTEGER, etc.)
+            type_parts.append(self._advance().value.upper())
+        
+        # Précision/échelle optionnelle: (10) ou (10, 2)
+        if self._check(TokenType.LPAREN):
+            self._advance()
+            type_parts.append('(')
+            
+            # Lire jusqu'à RPAREN, en gérant les types imbriqués
+            depth = 1
+            while depth > 0 and not self._check(TokenType.EOF):
+                token = self._current()
+                if token.type == TokenType.LPAREN:
+                    depth += 1
+                elif token.type == TokenType.RPAREN:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                type_parts.append(token.value)
+                self._advance()
+            
+            type_parts.append(')')
+            self._expect(TokenType.RPAREN)
+        
+        # Types génériques: ARRAY<INT>, MAP<STRING, INT>
+        if self._check(TokenType.LESS_THAN):
+            self._advance()
+            type_parts.append('<')
+            
+            depth = 1
+            while depth > 0 and not self._check(TokenType.EOF):
+                token = self._current()
+                if token.type == TokenType.LESS_THAN:
+                    depth += 1
+                elif token.type == TokenType.GREATER_THAN:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                type_parts.append(token.value)
+                self._advance()
+            
+            type_parts.append('>')
+            self._expect(TokenType.GREATER_THAN)
+        
+        return ''.join(type_parts)
+    
+    # ============== Presto/Athena specific parsing ==============
+    
+    def _parse_jinja_expression(self) -> JinjaExpression:
+        """Parse une expression Jinja (dbt)."""
+        token = self._advance()
+        self.has_jinja = True
+        
+        jinja_type_map = {
+            TokenType.JINJA_EXPR: 'expression',
+            TokenType.JINJA_STMT: 'statement', 
+            TokenType.JINJA_COMMENT: 'comment'
+        }
+        
+        return JinjaExpression(
+            content=token.value,
+            jinja_type=jinja_type_map.get(token.type, 'expression')
+        )
+    
+    def _parse_array_expression(self) -> ArrayExpression:
+        """Parse ARRAY[...] (Presto/Athena)."""
+        self._expect(TokenType.ARRAY)
+        self._expect(TokenType.LBRACKET)
+        
+        elements = []
+        if not self._check(TokenType.RBRACKET):
+            while True:
+                elem = self._parse_expression()
+                elements.append(elem)
+                if not self._consume_if(TokenType.COMMA):
+                    break
+        
+        self._expect(TokenType.RBRACKET)
+        return ArrayExpression(elements=elements)
+    
+    def _parse_map_expression(self) -> MapExpression:
+        """Parse MAP(...) (Presto/Athena)."""
+        self._expect(TokenType.MAP)
+        self._expect(TokenType.LPAREN)
+        
+        keys = []
+        values = []
+        
+        if not self._check(TokenType.RPAREN):
+            # MAP(ARRAY[k1, k2], ARRAY[v1, v2]) ou MAP(k1, v1, k2, v2)
+            first_arg = self._parse_expression()
+            
+            if isinstance(first_arg, ArrayExpression):
+                # Format MAP(ARRAY[], ARRAY[])
+                keys_array = first_arg
+                self._expect(TokenType.COMMA)
+                values_array = self._parse_expression()
+                
+                if isinstance(values_array, ArrayExpression):
+                    keys = keys_array.elements
+                    values = values_array.elements
+            else:
+                # Format MAP(k1, v1, k2, v2, ...)
+                args = [first_arg]
+                while self._consume_if(TokenType.COMMA):
+                    args.append(self._parse_expression())
+                
+                # Pairs of key, value
+                for i in range(0, len(args), 2):
+                    keys.append(args[i])
+                    if i + 1 < len(args):
+                        values.append(args[i + 1])
+        
+        self._expect(TokenType.RPAREN)
+        return MapExpression(keys=keys, values=values)
+    
+    def _parse_row_expression(self) -> RowExpression:
+        """Parse ROW(...) (Presto/Athena)."""
+        self._expect(TokenType.ROW)
+        self._expect(TokenType.LPAREN)
+        
+        fields = []
+        if not self._check(TokenType.RPAREN):
+            while True:
+                field = self._parse_expression()
+                fields.append(field)
+                if not self._consume_if(TokenType.COMMA):
+                    break
+        
+        self._expect(TokenType.RPAREN)
+        return RowExpression(fields=fields)
+    
+    def _parse_interval_expression(self) -> IntervalExpression:
+        """Parse INTERVAL '1' DAY (Presto/Athena)."""
+        self._expect(TokenType.INTERVAL)
+        
+        value = self._parse_primary_expression()
+        
+        # Unit (DAY, HOUR, MINUTE, SECOND, MONTH, YEAR)
+        unit_token = self._current()
+        if unit_token.type == TokenType.IDENTIFIER:
+            unit = self._advance().value.upper()
+        else:
+            unit = "DAY"  # Default
+        
+        return IntervalExpression(value=value, unit=unit)
+    
+    def _parse_try_expression(self) -> Expression:
+        """Parse TRY(...) ou TRY_CAST(...) (Presto/Athena)."""
+        self._expect(TokenType.TRY)
+        
+        # Check for TRY_CAST
+        if self._current().type == TokenType.IDENTIFIER and self._current().value.upper() == '_CAST':
+            # Actually it would be parsed as TRY identifier, need different approach
+            pass
+        
+        self._expect(TokenType.LPAREN)
+        expr = self._parse_expression()
+        self._expect(TokenType.RPAREN)
+        
+        return TryExpression(expression=expr)
+    
+    def _parse_if_expression(self) -> IfExpression:
+        """Parse IF(cond, then, else) (Presto/Athena)."""
+        self._expect(TokenType.IF)
+        self._expect(TokenType.LPAREN)
+        
+        condition = self._parse_expression()
+        self._expect(TokenType.COMMA)
+        
+        then_expr = self._parse_expression()
+        
+        else_expr = None
+        if self._consume_if(TokenType.COMMA):
+            else_expr = self._parse_expression()
+        
+        self._expect(TokenType.RPAREN)
+        
+        return IfExpression(
+            condition=condition,
+            then_expr=then_expr,
+            else_expr=else_expr
+        )
+    
+    def _parse_lambda_expression(self, first_param: str) -> LambdaExpression:
+        """Parse une lambda: x -> x + 1 (Presto/Athena)."""
+        # Le premier paramètre a déjà été parsé
+        parameters = [first_param]
+        
+        # Si on a des parenthèses, il peut y avoir plusieurs paramètres
+        # (x, y) -> x + y
+        
+        self._expect(TokenType.ARROW)
+        body = self._parse_expression()
+        
+        return LambdaExpression(parameters=parameters, body=body)
+    
+    def _parse_postfix_expression(self, expr: Expression) -> Expression:
+        """Parse les expressions postfixes: array[i], expr AT TIME ZONE, etc."""
+        while True:
+            # Array subscript: arr[i]
+            if self._check(TokenType.LBRACKET):
+                self._advance()
+                index = self._parse_expression()
+                self._expect(TokenType.RBRACKET)
+                expr = ArraySubscript(array=expr, index=index)
+                continue
+            
+            # AT TIME ZONE
+            if self._check(TokenType.AT):
+                if self._peek().type == TokenType.TIME:
+                    self._advance()  # AT
+                    self._advance()  # TIME
+                    self._expect(TokenType.ZONE)
+                    timezone = self._parse_primary_expression()
+                    expr = AtTimeZone(expression=expr, timezone=timezone)
+                    continue
+            
+            # Lambda arrow (dans contexte de fonction comme transform, filter)
+            if self._check(TokenType.ARROW):
+                if isinstance(expr, ColumnRef):
+                    return self._parse_lambda_expression(expr.column)
+            
+            break
+        
+        return expr
 
 
-def parse(sql: str) -> ParseResult:
+def parse(sql: str, dialect: SQLDialect = None) -> ParseResult:
     """
     Fonction utilitaire pour parser du SQL.
     
     Args:
         sql: Le code SQL à parser
+        dialect: Dialecte SQL (auto-détecté si None)
         
     Returns:
         ParseResult contenant l'AST et les métadonnées
     """
-    parser = SQLParser()
+    parser = SQLParser(dialect=dialect)
     return parser.parse(sql)

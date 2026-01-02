@@ -52,6 +52,7 @@ class JoinType(Enum):
     FULL = "FULL"
     CROSS = "CROSS"
     NATURAL = "NATURAL"
+    LATERAL = "LATERAL"  # Presto/Athena
 
 
 class OrderDirection(Enum):
@@ -369,13 +370,183 @@ class CastExpression(Expression):
     """Expression CAST (ex: CAST(col AS INTEGER))."""
     expression: Expression
     target_type: str
+    is_try_cast: bool = False  # TRY_CAST pour Presto/Athena
     
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "node_type": "CastExpression",
+        result = {
+            "node_type": "TryCastExpression" if self.is_try_cast else "CastExpression",
             "expression": self.expression.to_dict(),
             "target_type": self.target_type
         }
+        return result
+
+
+# ============== Expressions Presto/Athena spécifiques ==============
+
+@dataclass
+class ArrayExpression(Expression):
+    """Expression ARRAY[...] (Presto/Athena)."""
+    elements: List[Expression] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "ArrayExpression",
+            "elements": [e.to_dict() for e in self.elements]
+        }
+
+
+@dataclass
+class MapExpression(Expression):
+    """Expression MAP(ARRAY[], ARRAY[]) ou MAP(k, v, ...) (Presto/Athena)."""
+    keys: List[Expression] = field(default_factory=list)
+    values: List[Expression] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "MapExpression",
+            "keys": [k.to_dict() for k in self.keys],
+            "values": [v.to_dict() for v in self.values]
+        }
+
+
+@dataclass
+class RowExpression(Expression):
+    """Expression ROW(...) (Presto/Athena)."""
+    fields: List[Expression] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "RowExpression",
+            "fields": [f.to_dict() for f in self.fields]
+        }
+
+
+@dataclass
+class ArraySubscript(Expression):
+    """Accès à un élément de tableau: array[index] (Presto/Athena)."""
+    array: Expression
+    index: Expression
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "ArraySubscript",
+            "array": self.array.to_dict(),
+            "index": self.index.to_dict()
+        }
+
+
+@dataclass
+class LambdaExpression(Expression):
+    """Expression lambda: x -> x + 1 (Presto/Athena)."""
+    parameters: List[str]
+    body: Expression
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "LambdaExpression",
+            "parameters": self.parameters,
+            "body": self.body.to_dict()
+        }
+
+
+@dataclass
+class IntervalExpression(Expression):
+    """Expression INTERVAL '1' DAY (Presto/Athena)."""
+    value: Expression
+    unit: str  # DAY, HOUR, MINUTE, SECOND, MONTH, YEAR
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "IntervalExpression",
+            "value": self.value.to_dict(),
+            "unit": self.unit
+        }
+
+
+@dataclass
+class AtTimeZone(Expression):
+    """Expression AT TIME ZONE (Presto/Athena)."""
+    expression: Expression
+    timezone: Expression
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "AtTimeZone",
+            "expression": self.expression.to_dict(),
+            "timezone": self.timezone.to_dict()
+        }
+
+
+@dataclass
+class TryExpression(Expression):
+    """Expression TRY(...) (Presto/Athena)."""
+    expression: Expression
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "TryExpression",
+            "expression": self.expression.to_dict()
+        }
+
+
+@dataclass
+class IfExpression(Expression):
+    """Expression IF(cond, then, else) (Presto/Athena)."""
+    condition: Expression
+    then_expr: Expression
+    else_expr: Optional[Expression] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "IfExpression",
+            "condition": self.condition.to_dict(),
+            "then": self.then_expr.to_dict()
+        }
+        if self.else_expr:
+            result["else"] = self.else_expr.to_dict()
+        return result
+
+
+@dataclass
+class JinjaExpression(Expression):
+    """Expression Jinja (dbt): {{ ref('table') }}, {{ var('x') }}."""
+    content: str
+    jinja_type: str  # 'expression', 'statement', 'comment'
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "JinjaExpression",
+            "content": self.content,
+            "jinja_type": self.jinja_type
+        }
+
+
+@dataclass
+class WindowFunction(Expression):
+    """Fonction de fenêtre avec OVER (Presto/Athena)."""
+    function: FunctionCall
+    partition_by: Optional[List[Expression]] = None
+    order_by: Optional[List['OrderByItem']] = None
+    frame_type: Optional[str] = None  # ROWS, RANGE
+    frame_start: Optional[str] = None  # UNBOUNDED PRECEDING, CURRENT ROW, etc.
+    frame_end: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "WindowFunction",
+            "function": self.function.to_dict()
+        }
+        if self.partition_by:
+            result["partition_by"] = [p.to_dict() for p in self.partition_by]
+        if self.order_by:
+            result["order_by"] = [o.to_dict() for o in self.order_by]
+        if self.frame_type:
+            result["frame"] = {
+                "type": self.frame_type,
+                "start": self.frame_start,
+                "end": self.frame_end
+            }
+        return result
 
 
 # ============== Éléments de SELECT ==============
@@ -404,6 +575,7 @@ class TableRef(ASTNode):
     name: str
     alias: Optional[str] = None
     schema: Optional[str] = None
+    is_jinja: bool = False  # True si c'est un template Jinja (dbt: {{ ref('...') }})
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -414,6 +586,8 @@ class TableRef(ASTNode):
             result["alias"] = self.alias
         if self.schema:
             result["schema"] = self.schema
+        if self.is_jinja:
+            result["is_jinja"] = True
         return result
 
 
@@ -428,6 +602,44 @@ class SubqueryRef(ASTNode):
             "node_type": "SubqueryRef",
             "query": self.query.to_dict(),
             "alias": self.alias
+        }
+
+
+@dataclass
+class UnnestRef(ASTNode):
+    """UNNEST dans FROM (Presto/Athena)."""
+    expression: Expression
+    alias: Optional[str] = None
+    with_ordinality: bool = False
+    ordinality_alias: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "UnnestRef",
+            "expression": self.expression.to_dict()
+        }
+        if self.alias:
+            result["alias"] = self.alias
+        if self.with_ordinality:
+            result["with_ordinality"] = True
+            if self.ordinality_alias:
+                result["ordinality_alias"] = self.ordinality_alias
+        return result
+
+
+@dataclass
+class TableSample(ASTNode):
+    """TABLESAMPLE (Presto/Athena)."""
+    table: Union['TableRef', 'SubqueryRef']
+    sample_type: str  # BERNOULLI ou SYSTEM
+    percentage: Expression
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "TableSample",
+            "table": self.table.to_dict(),
+            "sample_type": self.sample_type,
+            "percentage": self.percentage.to_dict()
         }
 
 
@@ -522,6 +734,7 @@ class SelectStatement(ASTNode):
     offset: Optional[Expression] = None
     distinct: bool = False
     ctes: Optional[List[CTEDefinition]] = None
+    metadata: Optional[Dict[str, Any]] = None  # Jinja config, etc.
     
     # Pour UNION, INTERSECT, EXCEPT
     set_operation: Optional[SetOperationType] = None
@@ -535,6 +748,9 @@ class SelectStatement(ASTNode):
         
         if self.distinct:
             result["distinct"] = True
+        
+        if self.metadata:
+            result["metadata"] = self.metadata
             
         if self.ctes:
             result["with"] = [cte.to_dict() for cte in self.ctes]

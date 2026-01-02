@@ -88,6 +88,35 @@ class TokenType(Enum):
     FIRST = auto()
     LAST = auto()
     
+    # Presto/Athena spécifiques
+    UNNEST = auto()
+    ORDINALITY = auto()
+    LATERAL = auto()
+    TABLESAMPLE = auto()
+    BERNOULLI = auto()
+    SYSTEM = auto()
+    TRY = auto()
+    ARRAY = auto()
+    MAP = auto()
+    ROW = auto()
+    INTERVAL = auto()
+    AT = auto()
+    ZONE = auto()
+    TIME = auto()
+    TIMESTAMP = auto()
+    DATE = auto()
+    GROUPING = auto()
+    SETS = auto()
+    CUBE = auto()
+    ROLLUP = auto()
+    FILTER = auto()
+    WITHIN = auto()
+    PRECEDING = auto()
+    FOLLOWING = auto()
+    UNBOUNDED = auto()
+    CURRENT = auto()
+    IF = auto()
+    
     # Littéraux
     INTEGER = auto()
     FLOAT = auto()
@@ -119,6 +148,16 @@ class TokenType(Enum):
     COLON = auto()            # :
     DOUBLE_COLON = auto()     # ::
     QUESTION = auto()         # ?
+    LBRACKET = auto()         # [
+    RBRACKET = auto()         # ]
+    ARROW = auto()            # ->
+    DOUBLE_ARROW = auto()     # =>
+    LAMBDA = auto()           # -> (dans contexte lambda)
+    
+    # Jinja/dbt templates
+    JINJA_EXPR = auto()       # {{ ... }}
+    JINJA_STMT = auto()       # {% ... %}
+    JINJA_COMMENT = auto()    # {# ... #}
     
     # Spéciaux
     COMMENT = auto()
@@ -205,6 +244,34 @@ class SQLTokenizer:
         'nulls': TokenType.NULLS,
         'first': TokenType.FIRST,
         'last': TokenType.LAST,
+        # Presto/Athena
+        'unnest': TokenType.UNNEST,
+        'ordinality': TokenType.ORDINALITY,
+        'lateral': TokenType.LATERAL,
+        'tablesample': TokenType.TABLESAMPLE,
+        'bernoulli': TokenType.BERNOULLI,
+        'system': TokenType.SYSTEM,
+        'try': TokenType.TRY,
+        'array': TokenType.ARRAY,
+        'map': TokenType.MAP,
+        'row': TokenType.ROW,
+        'interval': TokenType.INTERVAL,
+        'at': TokenType.AT,
+        'zone': TokenType.ZONE,
+        'time': TokenType.TIME,
+        'timestamp': TokenType.TIMESTAMP,
+        'date': TokenType.DATE,
+        'grouping': TokenType.GROUPING,
+        'sets': TokenType.SETS,
+        'cube': TokenType.CUBE,
+        'rollup': TokenType.ROLLUP,
+        'filter': TokenType.FILTER,
+        'within': TokenType.WITHIN,
+        'preceding': TokenType.PRECEDING,
+        'following': TokenType.FOLLOWING,
+        'unbounded': TokenType.UNBOUNDED,
+        'current': TokenType.CURRENT,
+        'if': TokenType.IF,
     }
     
     def __init__(self, sql: str, include_whitespace: bool = False, include_comments: bool = True):
@@ -287,6 +354,41 @@ class SQLTokenizer:
             value += self._advance()
         
         return self._make_token(TokenType.COMMENT, value, start_line, start_col, start_pos)
+    
+    def _read_jinja_template(self) -> Token:
+        """Lit un template Jinja ({{ }}, {% %}, {# #})."""
+        start_line, start_col, start_pos = self.line, self.column, self.pos
+        
+        opening = self._advance(2)  # Consomme {{ ou {% ou {#
+        value = opening
+        
+        # Détermine le type et la fermeture attendue
+        if opening == '{{':
+            close = '}}'
+            token_type = TokenType.JINJA_EXPR
+        elif opening == '{%':
+            close = '%}'
+            token_type = TokenType.JINJA_STMT
+        else:  # {#
+            close = '#}'
+            token_type = TokenType.JINJA_COMMENT
+        
+        # Lit jusqu'à la fermeture
+        depth = 1  # Pour gérer les Jinja imbriqués
+        while self._current_char() and depth > 0:
+            # Vérifie les ouvertures imbriquées
+            two_char = (self._current_char() or '') + (self._peek() or '')
+            
+            if two_char == close:
+                value += self._advance(2)
+                depth -= 1
+            elif two_char in ('{{', '{%', '{#'):
+                value += self._advance(2)
+                depth += 1
+            else:
+                value += self._advance()
+        
+        return self._make_token(token_type, value, start_line, start_col, start_pos)
     
     def _read_string(self, quote_char: str) -> Token:
         """Lit une chaîne de caractères (entre ' ou ")."""
@@ -397,6 +499,12 @@ class SQLTokenizer:
         elif two_char == '::':
             self._advance(2)
             return self._make_token(TokenType.DOUBLE_COLON, two_char, start_line, start_col, start_pos)
+        elif two_char == '->':
+            self._advance(2)
+            return self._make_token(TokenType.ARROW, two_char, start_line, start_col, start_pos)
+        elif two_char == '=>':
+            self._advance(2)
+            return self._make_token(TokenType.DOUBLE_ARROW, two_char, start_line, start_col, start_pos)
         
         # Opérateurs et ponctuation à un caractère
         self._advance()
@@ -415,6 +523,8 @@ class SQLTokenizer:
             ';': TokenType.SEMICOLON,
             '(': TokenType.LPAREN,
             ')': TokenType.RPAREN,
+            '[': TokenType.LBRACKET,
+            ']': TokenType.RBRACKET,
             ':': TokenType.COLON,
             '?': TokenType.QUESTION,
         }
@@ -442,6 +552,11 @@ class SQLTokenizer:
                 token = self._skip_whitespace()
                 if token:
                     self.tokens.append(token)
+                continue
+            
+            # Templates Jinja (dbt)
+            if char == '{' and self._peek() in ('{', '%', '#'):
+                self.tokens.append(self._read_jinja_template())
                 continue
             
             # Commentaires

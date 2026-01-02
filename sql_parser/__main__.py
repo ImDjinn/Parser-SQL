@@ -3,11 +3,13 @@
 SQL Parser - Script principal.
 
 Permet de parser du SQL depuis la ligne de commande ou un fichier.
+Supporte plusieurs dialectes: standard, presto, athena, trino, postgresql, mysql, bigquery, snowflake, spark.
 
 Usage:
     python -m sql_parser "SELECT * FROM users"
     python -m sql_parser -f query.sql
     python -m sql_parser -f query.sql -o result.json
+    python -m sql_parser --dialect athena -f dbt_model.sql
 """
 
 import argparse
@@ -16,6 +18,7 @@ import json
 from pathlib import Path
 
 from .parser import SQLParser
+from .dialects import SQLDialect
 from .json_exporter import ASTToJSONExporter
 
 
@@ -39,6 +42,14 @@ Exemples:
   
   # Afficher seulement les tokens
   python -m sql_parser --tokens "SELECT * FROM users"
+  
+  # Spécifier un dialecte (Presto/Athena pour dbt)
+  python -m sql_parser --dialect athena -f model.sql
+  
+  # Parser une requête dbt avec Jinja
+  python -m sql_parser --dialect athena "SELECT * FROM {{ ref('users') }}"
+
+Dialectes supportés: standard, presto, athena, trino, postgresql, mysql, bigquery, snowflake, spark
 """
     )
     
@@ -58,6 +69,14 @@ Exemples:
         "-o", "--output",
         type=str,
         help="Fichier de sortie JSON"
+    )
+    
+    parser.add_argument(
+        "-d", "--dialect",
+        type=str,
+        choices=['standard', 'presto', 'athena', 'trino', 'postgresql', 'mysql', 'bigquery', 'snowflake', 'spark'],
+        default=None,
+        help="Dialecte SQL à utiliser (auto-détection si non spécifié)"
     )
     
     parser.add_argument(
@@ -153,9 +172,25 @@ Exemples:
         
         return
     
+    # Déterminer le dialecte
+    dialect = None
+    if args.dialect:
+        dialect_map = {
+            'standard': SQLDialect.STANDARD,
+            'presto': SQLDialect.PRESTO,
+            'athena': SQLDialect.ATHENA,
+            'trino': SQLDialect.TRINO,
+            'postgresql': SQLDialect.POSTGRESQL,
+            'mysql': SQLDialect.MYSQL,
+            'bigquery': SQLDialect.BIGQUERY,
+            'snowflake': SQLDialect.SNOWFLAKE,
+            'spark': SQLDialect.SPARK,
+        }
+        dialect = dialect_map.get(args.dialect)
+    
     # Parsing
     try:
-        sql_parser = SQLParser()
+        sql_parser = SQLParser(dialect=dialect)
         result = sql_parser.parse(sql)
     except Exception as e:
         print(f"Erreur de parsing: {e}", file=sys.stderr)
