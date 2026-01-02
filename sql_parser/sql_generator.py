@@ -188,6 +188,36 @@ class SQLGenerator:
         
         return result
     
+    def _gen_WindowFunction(self, node) -> str:
+        """Génère une fonction de fenêtre avec OVER."""
+        # Générer l'appel de fonction de base
+        func_str = self._gen_FunctionCall(node.function)
+        
+        # Construire la clause OVER
+        over_parts = []
+        
+        # PARTITION BY
+        if node.partition_by:
+            partition_exprs = ', '.join(self._generate_node(e) for e in node.partition_by)
+            over_parts.append(f"{self._kw('PARTITION BY')} {partition_exprs}")
+        
+        # ORDER BY
+        if node.order_by:
+            order_exprs = ', '.join(self._gen_OrderByItem(o) for o in node.order_by)
+            over_parts.append(f"{self._kw('ORDER BY')} {order_exprs}")
+        
+        # Frame specification
+        if node.frame_type:
+            frame_str = node.frame_type.upper() if self.uppercase_keywords else node.frame_type.lower()
+            if node.frame_end:
+                frame_str += f" {self._kw('BETWEEN')} {node.frame_start} {self._kw('AND')} {node.frame_end}"
+            else:
+                frame_str += f" {node.frame_start}"
+            over_parts.append(frame_str)
+        
+        over_clause = ' '.join(over_parts)
+        return f"{func_str} {self._kw('OVER')} ({over_clause})"
+    
     def _gen_CastExpression(self, node: CastExpression) -> str:
         """Génère un CAST."""
         expr = self._generate_node(node.expression)
@@ -331,8 +361,15 @@ class SQLGenerator:
         else:
             parts = []
             if node.schema:
-                parts.append(node.schema)
-            parts.append(node.name)
+                schema = node.schema
+                if getattr(node, 'schema_quoted', False):
+                    schema = f'"{schema}"'
+                parts.append(schema)
+            # Gérer les identifiants quotés
+            name = node.name
+            if getattr(node, 'quoted', False):
+                name = f'"{name}"'
+            parts.append(name)
             result = '.'.join(parts)
         
         if node.alias:

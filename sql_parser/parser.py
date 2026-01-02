@@ -610,25 +610,45 @@ class SQLParser:
         
         # Table normale
         # Gestion du schéma: schema.table
-        name_token = self._expect(TokenType.IDENTIFIER, "Expected table name")
+        # Accepte IDENTIFIER ou QUOTED_IDENTIFIER
+        if not self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER):
+            raise SQLParserError("Expected table name", self._current())
+        
+        name_token = self._advance()
         schema = None
+        schema_quoted = False
         name = name_token.value
+        quoted = name_token.type == TokenType.QUOTED_IDENTIFIER
+        
+        # Retirer les guillemets si c'est un identifiant quoté
+        if quoted and len(name) >= 2:
+            name = name[1:-1]
         
         if self._consume_if(TokenType.DOT):
+            # Ce qu'on avait comme "name" est en fait le schema
             schema = name
-            name_token = self._expect(TokenType.IDENTIFIER, "Expected table name after schema")
+            schema_quoted = quoted
+            if not self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER):
+                raise SQLParserError("Expected table name after schema", self._current())
+            name_token = self._advance()
             name = name_token.value
+            quoted = name_token.type == TokenType.QUOTED_IDENTIFIER
+            if quoted and len(name) >= 2:
+                name = name[1:-1]
         
         self.tables_referenced.add(name)
         
         # Alias
         alias = None
         if self._consume_if(TokenType.AS):
-            alias = self._expect(TokenType.IDENTIFIER, "Expected alias").value
-        elif self._check(TokenType.IDENTIFIER) and not self._is_keyword(self._current()):
+            if self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER):
+                alias = self._advance().value
+            else:
+                raise SQLParserError("Expected alias", self._current())
+        elif self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER) and not self._is_keyword(self._current()):
             alias = self._advance().value
         
-        return TableRef(name=name, alias=alias, schema=schema)
+        return TableRef(name=name, alias=alias, schema=schema, quoted=quoted, schema_quoted=schema_quoted)
     
     def _parse_unnest_ref(self) -> UnnestRef:
         """Parse UNNEST(...) [WITH ORDINALITY] (Presto/Athena)."""
@@ -757,33 +777,38 @@ class SQLParser:
         
         items = []
         while True:
-            expr = self._parse_expression()
-            
-            # Direction
-            direction = OrderDirection.ASC
-            if self._consume_if(TokenType.ASC):
-                direction = OrderDirection.ASC
-            elif self._consume_if(TokenType.DESC):
-                direction = OrderDirection.DESC
-            
-            # NULLS FIRST/LAST
-            nulls_first = None
-            if self._consume_if(TokenType.NULLS):
-                if self._consume_if(TokenType.FIRST):
-                    nulls_first = True
-                elif self._consume_if(TokenType.LAST):
-                    nulls_first = False
-            
-            items.append(OrderByItem(
-                expression=expr,
-                direction=direction,
-                nulls_first=nulls_first
-            ))
+            item = self._parse_order_by_item()
+            items.append(item)
             
             if not self._consume_if(TokenType.COMMA):
                 break
         
         return items
+    
+    def _parse_order_by_item(self) -> OrderByItem:
+        """Parse un seul élément ORDER BY."""
+        expr = self._parse_expression()
+        
+        # Direction
+        direction = OrderDirection.ASC
+        if self._consume_if(TokenType.ASC):
+            direction = OrderDirection.ASC
+        elif self._consume_if(TokenType.DESC):
+            direction = OrderDirection.DESC
+        
+        # NULLS FIRST/LAST
+        nulls_first = None
+        if self._consume_if(TokenType.NULLS):
+            if self._consume_if(TokenType.FIRST):
+                nulls_first = True
+            elif self._consume_if(TokenType.LAST):
+                nulls_first = False
+        
+        return OrderByItem(
+            expression=expr,
+            direction=direction,
+            nulls_first=nulls_first
+        )
     
     # ============== Parsing des expressions ==============
     
@@ -1086,7 +1111,7 @@ class SQLParser:
         }
         return self._current().type in callable_keywords
     
-    def _parse_aggregate_function(self) -> FunctionCall:
+    def _parse_aggregate_function(self) -> Expression:
         """Parse une fonction d'agrégation."""
         func_token = self._advance()
         func_name = func_token.value.upper()
@@ -1111,7 +1136,13 @@ class SQLParser:
         
         self._expect(TokenType.RPAREN)
         
-        return FunctionCall(name=func_name, args=args, distinct=distinct)
+        func = FunctionCall(name=func_name, args=args, distinct=distinct)
+        
+        # Check for OVER clause (window function)
+        if self._check(TokenType.OVER):
+            return self._parse_window_function(func)
+        
+        return func
     
     def _parse_identifier_or_function(self) -> Expression:
         """Parse un identifiant ou un appel de fonction."""
@@ -1156,7 +1187,13 @@ class SQLParser:
                             break
             
             self._expect(TokenType.RPAREN)
-            return FunctionCall(name=func_name, args=args, distinct=distinct)
+            func = FunctionCall(name=func_name, args=args, distinct=distinct)
+            
+            # Check for OVER clause (window function)
+            if self._check(TokenType.OVER):
+                return self._parse_window_function(func)
+            
+            return func
         
         # Référence de colonne avec table/schema
         if self._consume_if(TokenType.DOT):
@@ -1206,6 +1243,87 @@ class SQLParser:
             when_clauses=when_clauses,
             else_clause=else_clause
         )
+    
+    def _parse_window_function(self, func: FunctionCall) -> WindowFunction:
+        """Parse une window function avec OVER clause."""
+        self._expect(TokenType.OVER)
+        self._expect(TokenType.LPAREN)
+        
+        partition_by = None
+        order_by = None
+        frame_type = None
+        frame_start = None
+        frame_end = None
+        
+        # PARTITION BY
+        if self._check(TokenType.PARTITION):
+            self._advance()
+            self._expect(TokenType.BY)
+            partition_by = []
+            while True:
+                expr = self._parse_expression()
+                partition_by.append(expr)
+                if not self._consume_if(TokenType.COMMA):
+                    break
+        
+        # ORDER BY
+        if self._check(TokenType.ORDER):
+            self._advance()
+            self._expect(TokenType.BY)
+            order_by = []
+            while True:
+                order_item = self._parse_order_by_item()
+                order_by.append(order_item)
+                if not self._consume_if(TokenType.COMMA):
+                    break
+        
+        # Frame specification: ROWS/RANGE BETWEEN ... AND ...
+        if self._check(TokenType.ROWS) or self._check(TokenType.RANGE):
+            frame_type = self._advance().value.upper()
+            
+            if self._consume_if(TokenType.BETWEEN):
+                frame_start = self._parse_frame_bound()
+                self._expect(TokenType.AND)
+                frame_end = self._parse_frame_bound()
+            else:
+                # Just frame start (e.g., ROWS UNBOUNDED PRECEDING)
+                frame_start = self._parse_frame_bound()
+        
+        self._expect(TokenType.RPAREN)
+        
+        return WindowFunction(
+            function=func,
+            partition_by=partition_by,
+            order_by=order_by,
+            frame_type=frame_type,
+            frame_start=frame_start,
+            frame_end=frame_end
+        )
+    
+    def _parse_frame_bound(self) -> str:
+        """Parse a window frame bound (UNBOUNDED PRECEDING, CURRENT ROW, etc.)."""
+        if self._check(TokenType.UNBOUNDED):
+            self._advance()
+            if self._check(TokenType.PRECEDING):
+                self._advance()
+                return "UNBOUNDED PRECEDING"
+            elif self._check(TokenType.FOLLOWING):
+                self._advance()
+                return "UNBOUNDED FOLLOWING"
+        elif self._check(TokenType.CURRENT):
+            self._advance()
+            self._expect(TokenType.ROW)
+            return "CURRENT ROW"
+        else:
+            # N PRECEDING or N FOLLOWING
+            expr = self._parse_expression()
+            if self._check(TokenType.PRECEDING):
+                self._advance()
+                return f"{expr} PRECEDING"
+            elif self._check(TokenType.FOLLOWING):
+                self._advance()
+                return f"{expr} FOLLOWING"
+        return "CURRENT ROW"
     
     def _parse_type_name(self) -> str:
         """Parse un nom de type SQL (ex: DOUBLE, VARCHAR(255), ARRAY<INT>)."""

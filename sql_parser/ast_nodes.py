@@ -576,6 +576,8 @@ class TableRef(ASTNode):
     alias: Optional[str] = None
     schema: Optional[str] = None
     is_jinja: bool = False  # True si c'est un template Jinja (dbt: {{ ref('...') }})
+    quoted: bool = False    # True si le nom est entre guillemets
+    schema_quoted: bool = False  # True si le schema est entre guillemets
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -588,6 +590,10 @@ class TableRef(ASTNode):
             result["schema"] = self.schema
         if self.is_jinja:
             result["is_jinja"] = True
+        if self.quoted:
+            result["quoted"] = True
+        if self.schema_quoted:
+            result["schema_quoted"] = True
         return result
 
 
