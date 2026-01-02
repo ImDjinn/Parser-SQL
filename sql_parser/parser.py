@@ -705,6 +705,35 @@ class SQLParser:
         
         return TableRef(name=name, alias=alias, schema=schema, quoted=quoted, schema_quoted=schema_quoted)
     
+    def _parse_table_name_only(self) -> TableRef:
+        """Parse un nom de table sans alias (pour CREATE TABLE, DROP TABLE, etc.)."""
+        if not self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER):
+            raise SQLParserError("Expected table name", self._current())
+        
+        name_token = self._advance()
+        schema = None
+        schema_quoted = False
+        name = name_token.value
+        quoted = name_token.type == TokenType.QUOTED_IDENTIFIER
+        
+        # Retirer les guillemets si c'est un identifiant quoté
+        if quoted and len(name) >= 2:
+            name = name[1:-1]
+        
+        # Gestion du schéma: schema.table
+        if self._consume_if(TokenType.DOT):
+            schema = name
+            schema_quoted = quoted
+            if not self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER):
+                raise SQLParserError("Expected table name after schema", self._current())
+            name_token = self._advance()
+            name = name_token.value
+            quoted = name_token.type == TokenType.QUOTED_IDENTIFIER
+            if quoted and len(name) >= 2:
+                name = name[1:-1]
+        
+        return TableRef(name=name, alias=None, schema=schema, quoted=quoted, schema_quoted=schema_quoted)
+    
     def _parse_unnest_ref(self) -> UnnestRef:
         """Parse UNNEST(...) [WITH ORDINALITY] (Presto/Athena)."""
         self._expect(TokenType.UNNEST)
@@ -2053,8 +2082,8 @@ class SQLParser:
             self._expect(TokenType.EXISTS)
             if_not_exists = True
         
-        # Nom de la table
-        table = self._parse_table_ref()
+        # Nom de la table (sans alias - utiliser méthode spécifique)
+        table = self._parse_table_name_only()
         
         columns = []
         constraints = []
@@ -2123,9 +2152,21 @@ class SQLParser:
     
     def _parse_column_definition(self) -> ColumnDefinition:
         """Parse une définition de colonne."""
-        # Nom de colonne
-        name_token = self._expect(TokenType.IDENTIFIER, "Expected column name")
-        name = name_token.value
+        # Nom de colonne - accepte aussi certains mots-clés courants comme noms de colonnes
+        # KEY, VALUE, DATA, TYPE, NAME, etc. sont souvent utilisés comme noms de colonnes
+        if self._check(TokenType.IDENTIFIER):
+            name_token = self._advance()
+            name = name_token.value
+        elif self._current().type in (TokenType.KEY, TokenType.DATE,
+                                       TokenType.TIME, TokenType.TIMESTAMP, TokenType.COMMENT):
+            # Accepter ces mots-clés comme noms de colonnes
+            name_token = self._advance()
+            name = name_token.value
+        elif self._check(TokenType.QUOTED_IDENTIFIER):
+            name_token = self._advance()
+            name = name_token.value[1:-1] if len(name_token.value) >= 2 else name_token.value
+        else:
+            raise SQLParserError("Expected column name", self._current())
         
         # Type de données
         data_type = self._parse_type_name()
