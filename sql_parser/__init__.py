@@ -8,9 +8,10 @@ Ce module fournit:
 - Export JSON: Conversion de l'AST en JSON
 - SQL Generator: Reconstruction du SQL à partir de l'AST (réversibilité)
 - Transpiler: Traduction de SQL entre dialectes (Presto ↔ PostgreSQL ↔ MySQL ↔ BigQuery)
+- DBT Converter: Conversion de DML/DDL en modèles dbt (T-SQL → dbt Athena)
 
 Usage:
-    from sql_parser import SQLParser, SQLGenerator, transpile
+    from sql_parser import SQLParser, SQLGenerator, transpile, convert_to_dbt
     
     # Parser SQL -> AST
     parser = SQLParser()
@@ -28,6 +29,14 @@ Usage:
         target_dialect="postgresql"
     )
     print(result.sql)  # CASE WHEN x > 0 THEN 'positive' ELSE 'negative' END
+    
+    # Convertir T-SQL vers dbt Athena
+    result = convert_to_dbt(
+        "INSERT INTO target SELECT * FROM source WHERE date > '2024-01-01'",
+        source_dialect="tsql",
+        target_dialect="athena"
+    )
+    print(result.models[0].to_file_content())
 """
 
 from .tokenizer import SQLTokenizer, Token, TokenType
@@ -37,8 +46,9 @@ from .json_exporter import ASTToJSONExporter
 from .sql_generator import SQLGenerator, generate_sql
 from .dialects import SQLDialect
 from .transpiler import SQLTranspiler, transpile, TranspilationResult
+from .dbt_converter import DbtConverter, DbtModel, DbtConfig, convert_to_dbt, ConversionResult
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __all__ = [
     "SQLParser",
     "SQLTokenizer", 
@@ -51,4 +61,9 @@ __all__ = [
     "SQLTranspiler",
     "transpile",
     "TranspilationResult",
+    "DbtConverter",
+    "DbtModel",
+    "DbtConfig",
+    "convert_to_dbt",
+    "ConversionResult",
 ]

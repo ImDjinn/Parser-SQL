@@ -23,7 +23,7 @@ class TestBasicParsing:
         parser = SQLParser()
         result = parser.parse("SELECT * FROM users WHERE age > 18")
         assert result.statement is not None
-        assert result.statement.where is not None
+        assert result.statement.where_clause is not None
     
     def test_select_with_join(self):
         parser = SQLParser()
@@ -43,7 +43,7 @@ class TestBasicParsing:
             HAVING COUNT(*) > 5
         """)
         assert result.statement.group_by is not None
-        assert result.statement.having is not None
+        assert result.statement.having_clause is not None
         assert result.has_aggregation is True
     
     def test_select_with_order_limit(self):
@@ -82,28 +82,28 @@ class TestDMLStatements:
     def test_insert_values(self):
         parser = SQLParser()
         result = parser.parse("INSERT INTO users (id, name) VALUES (1, 'John'), (2, 'Jane')")
-        assert result.statement.node_type == "InsertStatement"
+        assert type(result.statement).__name__ == "InsertStatement"
         assert result.statement.table.name == "users"
         assert len(result.statement.values) == 2
     
     def test_insert_select(self):
         parser = SQLParser()
         result = parser.parse("INSERT INTO archive SELECT * FROM users WHERE status = 'inactive'")
-        assert result.statement.node_type == "InsertStatement"
-        assert result.statement.select_statement is not None
+        assert type(result.statement).__name__ == "InsertStatement"
+        assert result.statement.query is not None
     
     def test_update(self):
         parser = SQLParser()
         result = parser.parse("UPDATE users SET status = 'inactive' WHERE last_login < '2024-01-01'")
-        assert result.statement.node_type == "UpdateStatement"
+        assert type(result.statement).__name__ == "UpdateStatement"
         assert len(result.statement.assignments) == 1
-        assert result.statement.where is not None
+        assert result.statement.where_clause is not None
     
     def test_delete(self):
         parser = SQLParser()
         result = parser.parse("DELETE FROM orders WHERE created_at < NOW() - INTERVAL 30 DAY")
-        assert result.statement.node_type == "DeleteStatement"
-        assert result.statement.where is not None
+        assert type(result.statement).__name__ == "DeleteStatement"
+        assert result.statement.where_clause is not None
     
     def test_merge(self):
         parser = SQLParser()
@@ -113,7 +113,7 @@ class TestDMLStatements:
             WHEN MATCHED THEN UPDATE SET t.name = s.name
             WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name)
         """)
-        assert result.statement.node_type == "MergeStatement"
+        assert type(result.statement).__name__ == "MergeStatement"
         assert len(result.statement.when_clauses) == 2
 
 
@@ -130,31 +130,31 @@ class TestDDLStatements:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        assert result.statement.node_type == "CreateTableStatement"
+        assert type(result.statement).__name__ == "CreateTableStatement"
         assert len(result.statement.columns) == 4
     
     def test_create_view(self):
         parser = SQLParser()
         result = parser.parse("CREATE VIEW active_users AS SELECT * FROM users WHERE status = 'active'")
-        assert result.statement.node_type == "CreateViewStatement"
-        assert result.statement.select_statement is not None
+        assert type(result.statement).__name__ == "CreateViewStatement"
+        assert result.statement.query is not None
     
     def test_drop_table(self):
         parser = SQLParser()
         result = parser.parse("DROP TABLE IF EXISTS temp_data CASCADE")
-        assert result.statement.node_type == "DropStatement"
+        assert type(result.statement).__name__ == "DropStatement"
         assert result.statement.if_exists is True
         assert result.statement.cascade is True
     
     def test_alter_table(self):
         parser = SQLParser()
         result = parser.parse("ALTER TABLE users ADD COLUMN email VARCHAR(255)")
-        assert result.statement.node_type == "AlterTableStatement"
+        assert type(result.statement).__name__ == "AlterTableStatement"
     
     def test_truncate(self):
         parser = SQLParser()
         result = parser.parse("TRUNCATE TABLE logs")
-        assert result.statement.node_type == "TruncateStatement"
+        assert type(result.statement).__name__ == "TruncateStatement"
 
 
 class TestWindowFunctions:
