@@ -19,7 +19,14 @@ from .ast_nodes import (
     # Presto/Athena specific
     ArrayExpression, MapExpression, RowExpression, ArraySubscript,
     LambdaExpression, IntervalExpression, AtTimeZone, TryExpression,
-    IfExpression, JinjaExpression, WindowFunction, UnnestRef, TableSample
+    IfExpression, JinjaExpression, WindowFunction, UnnestRef, TableSample,
+    # DML statements
+    InsertStatement, UpdateStatement, DeleteStatement, MergeStatement,
+    Assignment, OnConflictClause, MergeWhenClause,
+    # DDL statements
+    CreateTableStatement, CreateViewStatement, DropStatement,
+    AlterTableStatement, AlterTableAction, TruncateStatement,
+    ColumnDefinition, TableConstraint
 )
 
 
@@ -173,9 +180,14 @@ class SQLParser:
         
         return result
     
-    def _extract_implicit_info(self, statement: SelectStatement) -> dict:
+    def _extract_implicit_info(self, statement) -> dict:
         """Extrait les informations implicites de la requête."""
         info = {}
+        
+        # Uniquement pour SELECT
+        if not isinstance(statement, SelectStatement):
+            info["statement_type"] = type(statement).__name__
+            return info
         
         # Vérifie si toutes les colonnes non-agrégées sont dans GROUP BY
         if self.has_aggregation and not statement.group_by:
@@ -198,8 +210,8 @@ class SQLParser:
         
         return info
     
-    def _parse_statement(self) -> SelectStatement:
-        """Parse un statement SQL (pour l'instant, uniquement SELECT)."""
+    def _parse_statement(self):
+        """Parse un statement SQL (SELECT, INSERT, UPDATE, DELETE, MERGE, DDL)."""
         # Consommer les templates Jinja de configuration au début (dbt)
         jinja_config_raw = []
         parsed_config = {}
@@ -214,10 +226,13 @@ class SQLParser:
                     parsed_config.update(config)
             self.has_jinja = True
         
-        # Gestion des CTE (WITH clause)
+        # Gestion des CTE (WITH clause) - uniquement pour SELECT
         ctes = None
         if self._check(TokenType.WITH):
             ctes = self._parse_cte_list()
+        
+        # Déterminer le type de statement
+        current = self._current()
         
         if self._check(TokenType.SELECT):
             statement = self._parse_select()
@@ -230,8 +245,33 @@ class SQLParser:
                 if parsed_config:
                     statement.metadata["dbt_config"] = parsed_config
             return statement
+        
+        elif self._check(TokenType.INSERT):
+            return self._parse_insert()
+        
+        elif self._check(TokenType.UPDATE):
+            return self._parse_update()
+        
+        elif self._check(TokenType.DELETE):
+            return self._parse_delete()
+        
+        elif self._check(TokenType.MERGE):
+            return self._parse_merge()
+        
+        elif self._check(TokenType.CREATE):
+            return self._parse_create()
+        
+        elif self._check(TokenType.DROP):
+            return self._parse_drop()
+        
+        elif self._check(TokenType.ALTER):
+            return self._parse_alter()
+        
+        elif self._check(TokenType.TRUNCATE):
+            return self._parse_truncate()
+        
         else:
-            raise SQLParserError("Expected SELECT statement", self._current())
+            raise SQLParserError(f"Unexpected statement type: {current.type.name}", current)
     
     def _parse_dbt_config(self, jinja_content: str) -> dict:
         """
@@ -690,16 +730,47 @@ class SQLParser:
             ordinality_alias=ordinality_alias
         )
     
+    def _parse_simple_table_ref(self) -> TableRef:
+        """Parse un nom de table simple (schema.table) sans alias."""
+        if not self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER):
+            raise SQLParserError("Expected table name", self._current())
+        
+        name_token = self._advance()
+        schema = None
+        name = name_token.value
+        quoted = name_token.type == TokenType.QUOTED_IDENTIFIER
+        
+        if quoted and len(name) >= 2:
+            name = name[1:-1]
+        
+        if self._consume_if(TokenType.DOT):
+            schema = name
+            if not self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER):
+                raise SQLParserError("Expected table name after schema", self._current())
+            name_token = self._advance()
+            name = name_token.value
+            if name_token.type == TokenType.QUOTED_IDENTIFIER and len(name) >= 2:
+                name = name[1:-1]
+        
+        return TableRef(name=name, schema=schema, quoted=quoted)
+    
     def _is_keyword(self, token: Token) -> bool:
         """Vérifie si un token IDENTIFIER est en fait un mot-clé contextuel."""
-        keywords = {
+        keyword_types = {
             TokenType.JOIN, TokenType.INNER, TokenType.LEFT, TokenType.RIGHT,
             TokenType.FULL, TokenType.OUTER, TokenType.CROSS, TokenType.NATURAL,
             TokenType.ON, TokenType.WHERE, TokenType.GROUP, TokenType.ORDER,
             TokenType.HAVING, TokenType.LIMIT, TokenType.OFFSET, TokenType.UNION,
-            TokenType.INTERSECT, TokenType.EXCEPT, TokenType.LATERAL, TokenType.UNNEST
+            TokenType.INTERSECT, TokenType.EXCEPT, TokenType.LATERAL, TokenType.UNNEST,
+            TokenType.SET, TokenType.VALUES, TokenType.DROP, TokenType.WHEN
         }
-        return token.type in keywords
+        if token.type in keyword_types:
+            return True
+        # Mots-clés reconnus comme IDENTIFIER mais qui ne devraient pas être des alias
+        keyword_values = {'ADD', 'MODIFY', 'RENAME', 'ALTER', 'USING', 'MATCHED', 'THEN'}
+        if token.type == TokenType.IDENTIFIER and token.value.upper() in keyword_values:
+            return True
+        return False
     
     def _try_parse_join(self) -> Optional[JoinClause]:
         """Tente de parser une clause JOIN."""
@@ -1563,6 +1634,707 @@ class SQLParser:
             break
         
         return expr
+
+    # ============== INSERT Statement ==============
+    
+    def _parse_insert(self) -> InsertStatement:
+        """Parse un statement INSERT INTO."""
+        self._expect(TokenType.INSERT)
+        self._expect(TokenType.INTO)
+        
+        # Table cible
+        table = self._parse_table_ref()
+        
+        # Colonnes optionnelles
+        columns = None
+        if self._check(TokenType.LPAREN):
+            self._advance()
+            columns = []
+            while True:
+                col_token = self._expect(TokenType.IDENTIFIER, "Expected column name")
+                columns.append(col_token.value)
+                if not self._consume_if(TokenType.COMMA):
+                    break
+            self._expect(TokenType.RPAREN)
+        
+        # VALUES ou SELECT
+        values = None
+        query = None
+        
+        if self._check(TokenType.VALUES):
+            self._advance()
+            values = []
+            while True:
+                self._expect(TokenType.LPAREN)
+                row = []
+                while True:
+                    if self._check(TokenType.DEFAULT):
+                        self._advance()
+                        row.append(Literal(value="DEFAULT", literal_type="keyword"))
+                    else:
+                        expr = self._parse_expression()
+                        row.append(expr)
+                    if not self._consume_if(TokenType.COMMA):
+                        break
+                self._expect(TokenType.RPAREN)
+                values.append(row)
+                if not self._consume_if(TokenType.COMMA):
+                    break
+        elif self._check(TokenType.SELECT):
+            query = self._parse_select()
+        else:
+            raise SQLParserError("Expected VALUES or SELECT after INSERT INTO", self._current())
+        
+        # ON CONFLICT (PostgreSQL UPSERT)
+        on_conflict = None
+        if self._check(TokenType.ON) and self._peek().type == TokenType.CONFLICT:
+            on_conflict = self._parse_on_conflict()
+        
+        return InsertStatement(
+            table=table,
+            columns=columns,
+            values=values,
+            query=query,
+            on_conflict=on_conflict
+        )
+    
+    def _parse_on_conflict(self) -> OnConflictClause:
+        """Parse ON CONFLICT clause pour PostgreSQL."""
+        self._expect(TokenType.ON)
+        self._expect(TokenType.CONFLICT)
+        
+        # Conflict target (colonnes)
+        conflict_target = None
+        if self._check(TokenType.LPAREN):
+            self._advance()
+            conflict_target = []
+            while True:
+                col = self._expect(TokenType.IDENTIFIER, "Expected column name")
+                conflict_target.append(col.value)
+                if not self._consume_if(TokenType.COMMA):
+                    break
+            self._expect(TokenType.RPAREN)
+        
+        self._expect(TokenType.DO)
+        
+        action = "NOTHING"
+        update_assignments = None
+        
+        if self._check(TokenType.NOTHING):
+            self._advance()
+        elif self._check(TokenType.UPDATE):
+            self._advance()
+            action = "UPDATE"
+            self._expect(TokenType.SET)
+            update_assignments = self._parse_assignments()
+        
+        return OnConflictClause(
+            conflict_target=conflict_target,
+            action=action,
+            update_assignments=update_assignments
+        )
+
+    # ============== UPDATE Statement ==============
+    
+    def _parse_update(self) -> UpdateStatement:
+        """Parse un statement UPDATE."""
+        self._expect(TokenType.UPDATE)
+        
+        # Table cible
+        table = self._parse_table_ref()
+        
+        # SET clause
+        self._expect(TokenType.SET)
+        assignments = self._parse_assignments()
+        
+        # FROM clause optionnelle (PostgreSQL)
+        from_clause = None
+        if self._check(TokenType.FROM):
+            from_clause = self._parse_from_clause()
+        
+        # WHERE clause optionnelle
+        where_clause = None
+        if self._check(TokenType.WHERE):
+            self._advance()
+            where_clause = self._parse_expression()
+        
+        return UpdateStatement(
+            table=table,
+            assignments=assignments,
+            from_clause=from_clause,
+            where_clause=where_clause
+        )
+    
+    def _parse_assignments(self) -> List[Assignment]:
+        """Parse une liste d'assignations col = valeur ou table.col = valeur."""
+        assignments = []
+        while True:
+            # Colonne (peut être préfixée par table: t.column)
+            col_name = self._expect(TokenType.IDENTIFIER, "Expected column name").value
+            if self._consume_if(TokenType.DOT):
+                # Ignorer le préfixe de table et prendre juste le nom de colonne
+                col_name = self._expect(TokenType.IDENTIFIER, "Expected column name after dot").value
+            
+            self._expect(TokenType.EQUALS)
+            value = self._parse_expression()
+            assignments.append(Assignment(column=col_name, value=value))
+            if not self._consume_if(TokenType.COMMA):
+                break
+        return assignments
+
+    # ============== DELETE Statement ==============
+    
+    def _parse_delete(self) -> DeleteStatement:
+        """Parse un statement DELETE."""
+        self._expect(TokenType.DELETE)
+        self._expect(TokenType.FROM)
+        
+        # Table cible
+        table = self._parse_table_ref()
+        
+        # USING clause optionnelle (PostgreSQL)
+        using = None
+        if self._check(TokenType.USING):
+            self._advance()
+            using = []
+            while True:
+                t = self._parse_table_ref()
+                using.append(t)
+                if not self._consume_if(TokenType.COMMA):
+                    break
+        
+        # WHERE clause optionnelle
+        where_clause = None
+        if self._check(TokenType.WHERE):
+            self._advance()
+            where_clause = self._parse_expression()
+        
+        return DeleteStatement(
+            table=table,
+            using=using,
+            where_clause=where_clause
+        )
+
+    # ============== MERGE Statement ==============
+    
+    def _parse_merge(self) -> MergeStatement:
+        """Parse un statement MERGE INTO."""
+        self._expect(TokenType.MERGE)
+        self._consume_if(TokenType.INTO)
+        
+        # Table cible
+        target = self._parse_table_ref()
+        
+        # USING clause
+        self._expect(TokenType.USING)
+        if self._check(TokenType.LPAREN):
+            # Sous-requête
+            self._advance()
+            subquery = self._parse_select()
+            self._expect(TokenType.RPAREN)
+            alias = None
+            self._consume_if(TokenType.AS)
+            if self._check(TokenType.IDENTIFIER):
+                alias = self._advance().value
+            source = SubqueryRef(query=subquery, alias=alias or "_source")
+        else:
+            source = self._parse_table_ref()
+        
+        # ON condition
+        self._expect(TokenType.ON)
+        on_condition = self._parse_expression()
+        
+        # WHEN clauses
+        when_clauses = []
+        while self._check(TokenType.WHEN):
+            when_clause = self._parse_merge_when_clause()
+            when_clauses.append(when_clause)
+        
+        return MergeStatement(
+            target=target,
+            source=source,
+            on_condition=on_condition,
+            when_clauses=when_clauses
+        )
+    
+    def _parse_merge_when_clause(self) -> MergeWhenClause:
+        """Parse une clause WHEN pour MERGE."""
+        self._expect(TokenType.WHEN)
+        
+        # MATCHED ou NOT MATCHED
+        matched = True
+        if self._check(TokenType.NOT):
+            self._advance()
+            matched = False
+        self._expect(TokenType.MATCHED)
+        
+        # BY TARGET ou BY SOURCE optionnel (SQL Server)
+        if self._check(TokenType.BY):
+            self._advance()
+            self._advance()  # TARGET ou SOURCE
+        
+        # Condition AND optionnelle
+        condition = None
+        if self._check(TokenType.AND):
+            self._advance()
+            condition = self._parse_expression()
+        
+        self._expect(TokenType.THEN)
+        
+        # Action: UPDATE, DELETE, INSERT
+        action = "UPDATE"
+        assignments = None
+        insert_columns = None
+        insert_values = None
+        
+        if self._check(TokenType.UPDATE):
+            self._advance()
+            self._expect(TokenType.SET)
+            assignments = self._parse_assignments()
+        elif self._check(TokenType.DELETE):
+            self._advance()
+            action = "DELETE"
+        elif self._check(TokenType.INSERT):
+            self._advance()
+            action = "INSERT"
+            
+            # Colonnes optionnelles
+            if self._check(TokenType.LPAREN):
+                self._advance()
+                insert_columns = []
+                while True:
+                    col = self._expect(TokenType.IDENTIFIER, "Expected column name")
+                    insert_columns.append(col.value)
+                    if not self._consume_if(TokenType.COMMA):
+                        break
+                self._expect(TokenType.RPAREN)
+            
+            # VALUES
+            self._expect(TokenType.VALUES)
+            self._expect(TokenType.LPAREN)
+            insert_values = []
+            while True:
+                if self._check(TokenType.DEFAULT):
+                    self._advance()
+                    insert_values.append(Literal(value="DEFAULT", literal_type="keyword"))
+                else:
+                    expr = self._parse_expression()
+                    insert_values.append(expr)
+                if not self._consume_if(TokenType.COMMA):
+                    break
+            self._expect(TokenType.RPAREN)
+        
+        return MergeWhenClause(
+            matched=matched,
+            condition=condition,
+            action=action,
+            assignments=assignments,
+            insert_columns=insert_columns,
+            insert_values=insert_values
+        )
+
+    # ============== CREATE Statement ==============
+    
+    def _parse_create(self) -> Union[CreateTableStatement, CreateViewStatement]:
+        """Parse un statement CREATE TABLE ou CREATE VIEW."""
+        self._expect(TokenType.CREATE)
+        
+        or_replace = False
+        if self._check(TokenType.OR):
+            self._advance()
+            if self._check(TokenType.REPLACE):
+                self._advance()
+                or_replace = True
+        
+        temporary = False
+        if self._match(TokenType.TEMPORARY, TokenType.TEMP):
+            self._advance()
+            temporary = True
+        
+        external = False
+        if self._check(TokenType.EXTERNAL):
+            self._advance()
+            external = True
+        
+        if self._check(TokenType.TABLE):
+            return self._parse_create_table(temporary, external)
+        elif self._check(TokenType.VIEW):
+            return self._parse_create_view(or_replace)
+        elif self._check(TokenType.INDEX):
+            # Pour l'instant, on renvoie une erreur
+            raise SQLParserError("CREATE INDEX not yet supported", self._current())
+        else:
+            raise SQLParserError("Expected TABLE or VIEW after CREATE", self._current())
+    
+    def _parse_create_table(self, temporary: bool = False, external: bool = False) -> CreateTableStatement:
+        """Parse CREATE TABLE."""
+        self._expect(TokenType.TABLE)
+        
+        if_not_exists = False
+        if self._check(TokenType.IF):
+            self._advance()
+            self._expect(TokenType.NOT)
+            self._expect(TokenType.EXISTS)
+            if_not_exists = True
+        
+        # Nom de la table
+        table = self._parse_table_ref()
+        
+        columns = []
+        constraints = []
+        as_query = None
+        location = None
+        stored_as = None
+        row_format = None
+        table_properties = None
+        
+        # CREATE TABLE AS SELECT
+        if self._check(TokenType.AS):
+            self._advance()
+            as_query = self._parse_select()
+        elif self._check(TokenType.LPAREN):
+            self._advance()
+            
+            # Colonnes et contraintes
+            while True:
+                if self._match(TokenType.PRIMARY, TokenType.FOREIGN, TokenType.UNIQUE, 
+                              TokenType.CHECK, TokenType.CONSTRAINT):
+                    constraint = self._parse_table_constraint()
+                    constraints.append(constraint)
+                else:
+                    column = self._parse_column_definition()
+                    columns.append(column)
+                
+                if not self._consume_if(TokenType.COMMA):
+                    break
+            
+            self._expect(TokenType.RPAREN)
+        
+        # Options Athena/Hive
+        while not self._check(TokenType.EOF) and not self._check(TokenType.SEMICOLON):
+            if self._current().value.upper() == 'LOCATION':
+                self._advance()
+                location = self._expect(TokenType.STRING, "Expected location string").value
+            elif self._current().value.upper() == 'STORED':
+                self._advance()
+                if self._check(TokenType.AS):
+                    self._advance()
+                stored_as = self._advance().value
+            elif self._current().value.upper() == 'ROW':
+                self._advance()
+                if self._current().value.upper() == 'FORMAT':
+                    self._advance()
+                row_format = self._advance().value
+            elif self._current().value.upper() == 'TBLPROPERTIES':
+                self._advance()
+                table_properties = self._parse_table_properties()
+            else:
+                break
+        
+        return CreateTableStatement(
+            table=table,
+            columns=columns,
+            constraints=constraints if constraints else None,
+            if_not_exists=if_not_exists,
+            temporary=temporary,
+            as_query=as_query,
+            external=external,
+            location=location,
+            stored_as=stored_as,
+            row_format=row_format,
+            table_properties=table_properties
+        )
+    
+    def _parse_column_definition(self) -> ColumnDefinition:
+        """Parse une définition de colonne."""
+        # Nom de colonne
+        name_token = self._expect(TokenType.IDENTIFIER, "Expected column name")
+        name = name_token.value
+        
+        # Type de données
+        data_type = self._parse_type_name()
+        
+        # Modificateurs
+        nullable = True
+        default = None
+        primary_key = False
+        unique = False
+        references = None
+        
+        while True:
+            if self._check(TokenType.NOT):
+                self._advance()
+                self._expect(TokenType.NULL)
+                nullable = False
+            elif self._check(TokenType.NULL):
+                self._advance()
+                nullable = True
+            elif self._check(TokenType.DEFAULT):
+                self._advance()
+                default = self._parse_expression()
+            elif self._check(TokenType.PRIMARY):
+                self._advance()
+                self._expect(TokenType.KEY)
+                primary_key = True
+            elif self._check(TokenType.UNIQUE):
+                self._advance()
+                unique = True
+            elif self._check(TokenType.REFERENCES):
+                self._advance()
+                ref_table = self._advance().value
+                if self._check(TokenType.LPAREN):
+                    self._advance()
+                    ref_col = self._advance().value
+                    self._expect(TokenType.RPAREN)
+                    references = f"{ref_table}({ref_col})"
+                else:
+                    references = ref_table
+            else:
+                break
+        
+        return ColumnDefinition(
+            name=name,
+            data_type=data_type,
+            nullable=nullable,
+            default=default,
+            primary_key=primary_key,
+            unique=unique,
+            references=references
+        )
+    
+    def _parse_table_constraint(self) -> TableConstraint:
+        """Parse une contrainte de table."""
+        name = None
+        if self._check(TokenType.CONSTRAINT):
+            self._advance()
+            name = self._expect(TokenType.IDENTIFIER, "Expected constraint name").value
+        
+        if self._check(TokenType.PRIMARY):
+            self._advance()
+            self._expect(TokenType.KEY)
+            columns = self._parse_column_list()
+            return TableConstraint(
+                constraint_type="PRIMARY KEY",
+                name=name,
+                columns=columns
+            )
+        elif self._check(TokenType.UNIQUE):
+            self._advance()
+            columns = self._parse_column_list()
+            return TableConstraint(
+                constraint_type="UNIQUE",
+                name=name,
+                columns=columns
+            )
+        elif self._check(TokenType.FOREIGN):
+            self._advance()
+            self._expect(TokenType.KEY)
+            columns = self._parse_column_list()
+            self._expect(TokenType.REFERENCES)
+            ref_table = self._advance().value
+            ref_columns = self._parse_column_list()
+            return TableConstraint(
+                constraint_type="FOREIGN KEY",
+                name=name,
+                columns=columns,
+                references_table=ref_table,
+                references_columns=ref_columns
+            )
+        elif self._check(TokenType.CHECK):
+            self._advance()
+            self._expect(TokenType.LPAREN)
+            check_expr = self._parse_expression()
+            self._expect(TokenType.RPAREN)
+            return TableConstraint(
+                constraint_type="CHECK",
+                name=name,
+                check_expression=check_expr
+            )
+        else:
+            raise SQLParserError("Expected constraint type", self._current())
+    
+    def _parse_column_list(self) -> List[str]:
+        """Parse une liste de colonnes entre parenthèses."""
+        self._expect(TokenType.LPAREN)
+        columns = []
+        while True:
+            col = self._expect(TokenType.IDENTIFIER, "Expected column name")
+            columns.append(col.value)
+            if not self._consume_if(TokenType.COMMA):
+                break
+        self._expect(TokenType.RPAREN)
+        return columns
+    
+    def _parse_table_properties(self) -> dict:
+        """Parse TBLPROPERTIES pour Athena/Hive."""
+        self._expect(TokenType.LPAREN)
+        props = {}
+        while True:
+            key = self._expect(TokenType.STRING, "Expected property key").value
+            self._expect(TokenType.EQUALS)
+            value = self._expect(TokenType.STRING, "Expected property value").value
+            props[key.strip("'")] = value.strip("'")
+            if not self._consume_if(TokenType.COMMA):
+                break
+        self._expect(TokenType.RPAREN)
+        return props
+    
+    def _parse_create_view(self, or_replace: bool = False) -> CreateViewStatement:
+        """Parse CREATE VIEW."""
+        self._expect(TokenType.VIEW)
+        
+        if_not_exists = False
+        if self._check(TokenType.IF):
+            self._advance()
+            self._expect(TokenType.NOT)
+            self._expect(TokenType.EXISTS)
+            if_not_exists = True
+        
+        # Nom de la vue (sans alias)
+        name = self._parse_simple_table_ref()
+        
+        # Colonnes optionnelles
+        columns = None
+        if self._check(TokenType.LPAREN):
+            columns = self._parse_column_list()
+        
+        self._expect(TokenType.AS)
+        query = self._parse_select()
+        
+        return CreateViewStatement(
+            name=name,
+            query=query,
+            columns=columns,
+            or_replace=or_replace,
+            if_not_exists=if_not_exists
+        )
+
+    # ============== DROP Statement ==============
+    
+    def _parse_drop(self) -> DropStatement:
+        """Parse un statement DROP."""
+        self._expect(TokenType.DROP)
+        
+        # Type d'objet
+        object_type = None
+        if self._check(TokenType.TABLE):
+            self._advance()
+            object_type = "TABLE"
+        elif self._check(TokenType.VIEW):
+            self._advance()
+            object_type = "VIEW"
+        elif self._check(TokenType.INDEX):
+            self._advance()
+            object_type = "INDEX"
+        elif self._check(TokenType.SCHEMA):
+            self._advance()
+            object_type = "SCHEMA"
+        elif self._check(TokenType.DATABASE):
+            self._advance()
+            object_type = "DATABASE"
+        else:
+            raise SQLParserError("Expected TABLE, VIEW, INDEX, SCHEMA or DATABASE after DROP", self._current())
+        
+        if_exists = False
+        if self._check(TokenType.IF):
+            self._advance()
+            self._expect(TokenType.EXISTS)
+            if_exists = True
+        
+        # Nom de l'objet
+        name = self._parse_table_ref()
+        
+        cascade = False
+        if self._check(TokenType.CASCADE):
+            self._advance()
+            cascade = True
+        elif self._check(TokenType.RESTRICT):
+            self._advance()
+        
+        return DropStatement(
+            object_type=object_type,
+            name=name,
+            if_exists=if_exists,
+            cascade=cascade
+        )
+
+    # ============== ALTER Statement ==============
+    
+    def _parse_alter(self) -> AlterTableStatement:
+        """Parse un statement ALTER TABLE."""
+        self._expect(TokenType.ALTER)
+        self._expect(TokenType.TABLE)
+        
+        table = self._parse_table_ref()
+        
+        actions = []
+        while True:
+            action = self._parse_alter_action()
+            actions.append(action)
+            if not self._consume_if(TokenType.COMMA):
+                break
+        
+        return AlterTableStatement(table=table, actions=actions)
+    
+    def _parse_alter_action(self) -> AlterTableAction:
+        """Parse une action ALTER TABLE."""
+        current = self._current()
+        
+        if current.value.upper() == 'ADD':
+            self._advance()
+            if self._check(TokenType.COLUMN) or self._check(TokenType.IDENTIFIER):
+                if self._current().value.upper() == 'COLUMN':
+                    self._advance()
+                column = self._parse_column_definition()
+                return AlterTableAction(action_type="ADD COLUMN", column=column)
+            elif self._match(TokenType.CONSTRAINT, TokenType.PRIMARY, TokenType.FOREIGN, TokenType.UNIQUE, TokenType.CHECK):
+                constraint = self._parse_table_constraint()
+                return AlterTableAction(action_type="ADD CONSTRAINT", constraint=constraint)
+        
+        elif self._check(TokenType.DROP):
+            self._advance()
+            if self._current().value.upper() == 'COLUMN':
+                self._advance()
+                col_name = self._expect(TokenType.IDENTIFIER, "Expected column name").value
+                return AlterTableAction(action_type="DROP COLUMN", old_name=col_name)
+            elif self._check(TokenType.CONSTRAINT):
+                self._advance()
+                constraint_name = self._expect(TokenType.IDENTIFIER, "Expected constraint name").value
+                return AlterTableAction(action_type="DROP CONSTRAINT", old_name=constraint_name)
+        
+        elif current.value.upper() == 'RENAME':
+            self._advance()
+            if self._current().value.upper() == 'COLUMN':
+                self._advance()
+                old_name = self._expect(TokenType.IDENTIFIER, "Expected old column name").value
+                if self._current().value.upper() == 'TO':
+                    self._advance()
+                new_name = self._expect(TokenType.IDENTIFIER, "Expected new column name").value
+                return AlterTableAction(action_type="RENAME COLUMN", old_name=old_name, new_name=new_name)
+            elif self._current().value.upper() == 'TO':
+                self._advance()
+                new_name = self._expect(TokenType.IDENTIFIER, "Expected new table name").value
+                return AlterTableAction(action_type="RENAME TABLE", new_name=new_name)
+        
+        elif current.value.upper() in ('MODIFY', 'ALTER'):
+            self._advance()
+            if self._current().value.upper() == 'COLUMN':
+                self._advance()
+            column = self._parse_column_definition()
+            return AlterTableAction(action_type="MODIFY COLUMN", column=column)
+        
+        raise SQLParserError(f"Unknown ALTER action: {current.value}", current)
+
+    # ============== TRUNCATE Statement ==============
+    
+    def _parse_truncate(self) -> TruncateStatement:
+        """Parse un statement TRUNCATE TABLE."""
+        self._expect(TokenType.TRUNCATE)
+        self._consume_if(TokenType.TABLE)
+        
+        table = self._parse_table_ref()
+        
+        return TruncateStatement(table=table)
 
 
 def parse(sql: str, dialect: SQLDialect = None) -> ParseResult:

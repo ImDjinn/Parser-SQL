@@ -791,6 +791,360 @@ class SelectStatement(ASTNode):
         return result
 
 
+# ============== INSERT Statement ==============
+
+@dataclass
+class InsertStatement(ASTNode):
+    """Statement INSERT INTO."""
+    table: TableRef
+    columns: Optional[List[str]] = None
+    values: Optional[List[List[Expression]]] = None  # Pour VALUES (...)
+    query: Optional['SelectStatement'] = None  # Pour INSERT ... SELECT
+    on_conflict: Optional['OnConflictClause'] = None  # PostgreSQL UPSERT
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "InsertStatement",
+            "table": self.table.to_dict()
+        }
+        if self.columns:
+            result["columns"] = self.columns
+        if self.values:
+            result["values"] = [[v.to_dict() for v in row] for row in self.values]
+        if self.query:
+            result["query"] = self.query.to_dict()
+        if self.on_conflict:
+            result["on_conflict"] = self.on_conflict.to_dict()
+        return result
+
+
+@dataclass
+class OnConflictClause(ASTNode):
+    """Clause ON CONFLICT pour PostgreSQL UPSERT."""
+    conflict_target: Optional[List[str]] = None  # Colonnes en conflit
+    action: str = "NOTHING"  # NOTHING ou UPDATE
+    update_assignments: Optional[List['Assignment']] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "OnConflictClause",
+            "action": self.action
+        }
+        if self.conflict_target:
+            result["conflict_target"] = self.conflict_target
+        if self.update_assignments:
+            result["update"] = [a.to_dict() for a in self.update_assignments]
+        return result
+
+
+# ============== UPDATE Statement ==============
+
+@dataclass
+class Assignment(ASTNode):
+    """Assignation col = valeur pour UPDATE/MERGE."""
+    column: str
+    value: Expression
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "Assignment",
+            "column": self.column,
+            "value": self.value.to_dict()
+        }
+
+
+@dataclass
+class UpdateStatement(ASTNode):
+    """Statement UPDATE."""
+    table: TableRef
+    assignments: List[Assignment]
+    from_clause: Optional[FromClause] = None  # Pour UPDATE ... FROM (PostgreSQL)
+    where_clause: Optional[Expression] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "UpdateStatement",
+            "table": self.table.to_dict(),
+            "set": [a.to_dict() for a in self.assignments]
+        }
+        if self.from_clause:
+            result["from"] = self.from_clause.to_dict()
+        if self.where_clause:
+            result["where"] = self.where_clause.to_dict()
+        return result
+
+
+# ============== DELETE Statement ==============
+
+@dataclass
+class DeleteStatement(ASTNode):
+    """Statement DELETE."""
+    table: TableRef
+    using: Optional[List[TableRef]] = None  # DELETE ... USING (PostgreSQL)
+    where_clause: Optional[Expression] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "DeleteStatement",
+            "table": self.table.to_dict()
+        }
+        if self.using:
+            result["using"] = [t.to_dict() for t in self.using]
+        if self.where_clause:
+            result["where"] = self.where_clause.to_dict()
+        return result
+
+
+# ============== MERGE Statement ==============
+
+@dataclass
+class MergeWhenClause(ASTNode):
+    """Clause WHEN pour MERGE."""
+    matched: bool  # True = WHEN MATCHED, False = WHEN NOT MATCHED
+    condition: Optional[Expression] = None  # AND condition optionnelle
+    action: str = "UPDATE"  # UPDATE, INSERT, DELETE
+    assignments: Optional[List[Assignment]] = None  # Pour UPDATE
+    insert_columns: Optional[List[str]] = None  # Pour INSERT
+    insert_values: Optional[List[Expression]] = None  # Pour INSERT
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "MergeWhenClause",
+            "matched": self.matched,
+            "action": self.action
+        }
+        if self.condition:
+            result["condition"] = self.condition.to_dict()
+        if self.assignments:
+            result["set"] = [a.to_dict() for a in self.assignments]
+        if self.insert_columns:
+            result["columns"] = self.insert_columns
+        if self.insert_values:
+            result["values"] = [v.to_dict() for v in self.insert_values]
+        return result
+
+
+@dataclass
+class MergeStatement(ASTNode):
+    """Statement MERGE INTO."""
+    target: TableRef
+    source: Union[TableRef, 'SubqueryRef']
+    on_condition: Expression
+    when_clauses: List[MergeWhenClause]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "MergeStatement",
+            "target": self.target.to_dict(),
+            "source": self.source.to_dict(),
+            "on": self.on_condition.to_dict(),
+            "when_clauses": [w.to_dict() for w in self.when_clauses]
+        }
+
+
+# ============== DDL Statements ==============
+
+@dataclass
+class ColumnDefinition(ASTNode):
+    """Définition d'une colonne pour CREATE TABLE."""
+    name: str
+    data_type: str
+    nullable: bool = True
+    default: Optional[Expression] = None
+    primary_key: bool = False
+    unique: bool = False
+    references: Optional[str] = None  # FOREIGN KEY table(column)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "ColumnDefinition",
+            "name": self.name,
+            "data_type": self.data_type,
+            "nullable": self.nullable
+        }
+        if self.default:
+            result["default"] = self.default.to_dict()
+        if self.primary_key:
+            result["primary_key"] = True
+        if self.unique:
+            result["unique"] = True
+        if self.references:
+            result["references"] = self.references
+        return result
+
+
+@dataclass
+class TableConstraint(ASTNode):
+    """Contrainte de table pour CREATE TABLE."""
+    constraint_type: str  # PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK
+    name: Optional[str] = None
+    columns: Optional[List[str]] = None
+    references_table: Optional[str] = None
+    references_columns: Optional[List[str]] = None
+    check_expression: Optional[Expression] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "TableConstraint",
+            "type": self.constraint_type
+        }
+        if self.name:
+            result["name"] = self.name
+        if self.columns:
+            result["columns"] = self.columns
+        if self.references_table:
+            result["references"] = {
+                "table": self.references_table,
+                "columns": self.references_columns
+            }
+        if self.check_expression:
+            result["check"] = self.check_expression.to_dict()
+        return result
+
+
+@dataclass
+class CreateTableStatement(ASTNode):
+    """Statement CREATE TABLE."""
+    table: TableRef
+    columns: List[ColumnDefinition]
+    constraints: Optional[List[TableConstraint]] = None
+    if_not_exists: bool = False
+    temporary: bool = False
+    as_query: Optional['SelectStatement'] = None  # CREATE TABLE AS SELECT
+    external: bool = False  # Athena EXTERNAL TABLE
+    location: Optional[str] = None  # Athena LOCATION
+    stored_as: Optional[str] = None  # Athena STORED AS
+    row_format: Optional[str] = None  # Athena ROW FORMAT
+    table_properties: Optional[Dict[str, str]] = None  # Athena TBLPROPERTIES
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "CreateTableStatement",
+            "table": self.table.to_dict()
+        }
+        if self.if_not_exists:
+            result["if_not_exists"] = True
+        if self.temporary:
+            result["temporary"] = True
+        if self.external:
+            result["external"] = True
+        if self.columns:
+            result["columns"] = [c.to_dict() for c in self.columns]
+        if self.constraints:
+            result["constraints"] = [c.to_dict() for c in self.constraints]
+        if self.as_query:
+            result["as"] = self.as_query.to_dict()
+        if self.location:
+            result["location"] = self.location
+        if self.stored_as:
+            result["stored_as"] = self.stored_as
+        if self.row_format:
+            result["row_format"] = self.row_format
+        if self.table_properties:
+            result["table_properties"] = self.table_properties
+        return result
+
+
+@dataclass
+class DropStatement(ASTNode):
+    """Statement DROP TABLE/VIEW/INDEX."""
+    object_type: str  # TABLE, VIEW, INDEX, SCHEMA, DATABASE
+    name: TableRef
+    if_exists: bool = False
+    cascade: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "DropStatement",
+            "object_type": self.object_type,
+            "name": self.name.to_dict()
+        }
+        if self.if_exists:
+            result["if_exists"] = True
+        if self.cascade:
+            result["cascade"] = True
+        return result
+
+
+@dataclass
+class AlterTableAction(ASTNode):
+    """Action pour ALTER TABLE."""
+    action_type: str  # ADD COLUMN, DROP COLUMN, RENAME COLUMN, MODIFY COLUMN, ADD CONSTRAINT, etc.
+    column: Optional[ColumnDefinition] = None
+    old_name: Optional[str] = None  # Pour RENAME
+    new_name: Optional[str] = None  # Pour RENAME
+    constraint: Optional[TableConstraint] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "AlterTableAction",
+            "action_type": self.action_type
+        }
+        if self.column:
+            result["column"] = self.column.to_dict()
+        if self.old_name:
+            result["old_name"] = self.old_name
+        if self.new_name:
+            result["new_name"] = self.new_name
+        if self.constraint:
+            result["constraint"] = self.constraint.to_dict()
+        return result
+
+
+@dataclass
+class AlterTableStatement(ASTNode):
+    """Statement ALTER TABLE."""
+    table: TableRef
+    actions: List[AlterTableAction]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "AlterTableStatement",
+            "table": self.table.to_dict(),
+            "actions": [a.to_dict() for a in self.actions]
+        }
+
+
+# ============== CREATE VIEW ==============
+
+@dataclass
+class CreateViewStatement(ASTNode):
+    """Statement CREATE VIEW."""
+    name: TableRef
+    query: SelectStatement
+    columns: Optional[List[str]] = None
+    or_replace: bool = False
+    if_not_exists: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "CreateViewStatement",
+            "name": self.name.to_dict(),
+            "query": self.query.to_dict()
+        }
+        if self.columns:
+            result["columns"] = self.columns
+        if self.or_replace:
+            result["or_replace"] = True
+        if self.if_not_exists:
+            result["if_not_exists"] = True
+        return result
+
+
+# ============== TRUNCATE ==============
+
+@dataclass
+class TruncateStatement(ASTNode):
+    """Statement TRUNCATE TABLE."""
+    table: TableRef
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "TruncateStatement",
+            "table": self.table.to_dict()
+        }
+
+
 # ============== Informations de parsing ==============
 
 @dataclass

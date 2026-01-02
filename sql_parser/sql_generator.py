@@ -68,8 +68,8 @@ class SQLGenerator:
         """Génère SQL depuis un ParseResult complet."""
         parts = []
         
-        # Ajouter les configs dbt en premier si présentes
-        if hasattr(result, 'statement') and result.statement.metadata:
+        # Ajouter les configs dbt en premier si présentes (seulement pour SelectStatement)
+        if hasattr(result, 'statement') and hasattr(result.statement, 'metadata') and result.statement.metadata:
             metadata = result.statement.metadata
             if 'jinja_config_raw' in metadata:
                 for config in metadata['jinja_config_raw']:
@@ -549,6 +549,258 @@ class SQLGenerator:
             parts.append(self._generate_node(node.set_query))
         
         return self._newline().join(parts)
+
+    # ============== INSERT Statement ==============
+    
+    def _gen_InsertStatement(self, node) -> str:
+        """Génère un statement INSERT INTO."""
+        parts = [f"{self._kw('INSERT INTO')} {self._generate_node(node.table)}"]
+        
+        if node.columns:
+            cols = ', '.join(node.columns)
+            parts[0] += f" ({cols})"
+        
+        if node.values:
+            value_rows = []
+            for row in node.values:
+                vals = ', '.join(self._generate_node(v) for v in row)
+                value_rows.append(f"({vals})")
+            parts.append(f"{self._kw('VALUES')} {', '.join(value_rows)}")
+        elif node.query:
+            parts.append(self._generate_node(node.query))
+        
+        if node.on_conflict:
+            parts.append(self._gen_OnConflictClause(node.on_conflict))
+        
+        return self._newline().join(parts)
+    
+    def _gen_OnConflictClause(self, node) -> str:
+        """Génère ON CONFLICT clause."""
+        parts = [self._kw('ON CONFLICT')]
+        if node.conflict_target:
+            parts.append(f"({', '.join(node.conflict_target)})")
+        parts.append(self._kw('DO'))
+        parts.append(self._kw(node.action))
+        if node.action == 'UPDATE' and node.update_assignments:
+            parts.append(self._kw('SET'))
+            assigns = ', '.join(f"{a.column} = {self._generate_node(a.value)}" for a in node.update_assignments)
+            parts.append(assigns)
+        return ' '.join(parts)
+
+    # ============== UPDATE Statement ==============
+    
+    def _gen_UpdateStatement(self, node) -> str:
+        """Génère un statement UPDATE."""
+        parts = [f"{self._kw('UPDATE')} {self._generate_node(node.table)}"]
+        
+        assigns = ', '.join(f"{a.column} = {self._generate_node(a.value)}" for a in node.assignments)
+        parts.append(f"{self._kw('SET')} {assigns}")
+        
+        if node.from_clause:
+            parts.append(self._generate_node(node.from_clause))
+        
+        if node.where_clause:
+            parts.append(f"{self._kw('WHERE')} {self._generate_node(node.where_clause)}")
+        
+        return self._newline().join(parts)
+    
+    def _gen_Assignment(self, node) -> str:
+        """Génère une assignation."""
+        return f"{node.column} = {self._generate_node(node.value)}"
+
+    # ============== DELETE Statement ==============
+    
+    def _gen_DeleteStatement(self, node) -> str:
+        """Génère un statement DELETE."""
+        parts = [f"{self._kw('DELETE FROM')} {self._generate_node(node.table)}"]
+        
+        if node.using:
+            using_tables = ', '.join(self._generate_node(t) for t in node.using)
+            parts.append(f"{self._kw('USING')} {using_tables}")
+        
+        if node.where_clause:
+            parts.append(f"{self._kw('WHERE')} {self._generate_node(node.where_clause)}")
+        
+        return self._newline().join(parts)
+
+    # ============== MERGE Statement ==============
+    
+    def _gen_MergeStatement(self, node) -> str:
+        """Génère un statement MERGE INTO."""
+        parts = [f"{self._kw('MERGE INTO')} {self._generate_node(node.target)}"]
+        parts.append(f"{self._kw('USING')} {self._generate_node(node.source)}")
+        parts.append(f"{self._kw('ON')} {self._generate_node(node.on_condition)}")
+        
+        for when_clause in node.when_clauses:
+            parts.append(self._gen_MergeWhenClause(when_clause))
+        
+        return self._newline().join(parts)
+    
+    def _gen_MergeWhenClause(self, node) -> str:
+        """Génère une clause WHEN pour MERGE."""
+        parts = [self._kw('WHEN')]
+        if not node.matched:
+            parts.append(self._kw('NOT'))
+        parts.append(self._kw('MATCHED'))
+        
+        if node.condition:
+            parts.append(f"{self._kw('AND')} {self._generate_node(node.condition)}")
+        
+        parts.append(self._kw('THEN'))
+        
+        if node.action == 'UPDATE':
+            parts.append(self._kw('UPDATE SET'))
+            assigns = ', '.join(f"{a.column} = {self._generate_node(a.value)}" for a in node.assignments)
+            parts.append(assigns)
+        elif node.action == 'DELETE':
+            parts.append(self._kw('DELETE'))
+        elif node.action == 'INSERT':
+            parts.append(self._kw('INSERT'))
+            if node.insert_columns:
+                parts.append(f"({', '.join(node.insert_columns)})")
+            parts.append(self._kw('VALUES'))
+            vals = ', '.join(self._generate_node(v) for v in node.insert_values)
+            parts.append(f"({vals})")
+        
+        return ' '.join(parts)
+
+    # ============== CREATE TABLE Statement ==============
+    
+    def _gen_CreateTableStatement(self, node) -> str:
+        """Génère un statement CREATE TABLE."""
+        parts = []
+        create_part = [self._kw('CREATE')]
+        if node.temporary:
+            create_part.append(self._kw('TEMPORARY'))
+        if node.external:
+            create_part.append(self._kw('EXTERNAL'))
+        create_part.append(self._kw('TABLE'))
+        if node.if_not_exists:
+            create_part.append(self._kw('IF NOT EXISTS'))
+        create_part.append(self._generate_node(node.table))
+        parts.append(' '.join(create_part))
+        
+        if node.as_query:
+            parts.append(f"{self._kw('AS')}")
+            parts.append(self._generate_node(node.as_query))
+        elif node.columns:
+            col_defs = []
+            for col in node.columns:
+                col_defs.append(self._gen_ColumnDefinition(col))
+            if node.constraints:
+                for constraint in node.constraints:
+                    col_defs.append(self._gen_TableConstraint(constraint))
+            parts.append(f"({', '.join(col_defs)})")
+        
+        if node.location:
+            parts.append(f"{self._kw('LOCATION')} '{node.location}'")
+        if node.stored_as:
+            parts.append(f"{self._kw('STORED AS')} {node.stored_as}")
+        
+        return self._newline().join(parts)
+    
+    def _gen_ColumnDefinition(self, node) -> str:
+        """Génère une définition de colonne."""
+        parts = [node.name, node.data_type]
+        if not node.nullable:
+            parts.append(self._kw('NOT NULL'))
+        if node.default:
+            parts.append(f"{self._kw('DEFAULT')} {self._generate_node(node.default)}")
+        if node.primary_key:
+            parts.append(self._kw('PRIMARY KEY'))
+        if node.unique:
+            parts.append(self._kw('UNIQUE'))
+        if node.references:
+            parts.append(f"{self._kw('REFERENCES')} {node.references}")
+        return ' '.join(parts)
+    
+    def _gen_TableConstraint(self, node) -> str:
+        """Génère une contrainte de table."""
+        parts = []
+        if node.name:
+            parts.append(f"{self._kw('CONSTRAINT')} {node.name}")
+        parts.append(self._kw(node.constraint_type))
+        if node.columns:
+            parts.append(f"({', '.join(node.columns)})")
+        if node.references_table:
+            parts.append(f"{self._kw('REFERENCES')} {node.references_table}")
+            if node.references_columns:
+                parts.append(f"({', '.join(node.references_columns)})")
+        if node.check_expression:
+            parts.append(f"({self._generate_node(node.check_expression)})")
+        return ' '.join(parts)
+
+    # ============== CREATE VIEW Statement ==============
+    
+    def _gen_CreateViewStatement(self, node) -> str:
+        """Génère un statement CREATE VIEW."""
+        parts = []
+        create_part = [self._kw('CREATE')]
+        if node.or_replace:
+            create_part.append(self._kw('OR REPLACE'))
+        create_part.append(self._kw('VIEW'))
+        if node.if_not_exists:
+            create_part.append(self._kw('IF NOT EXISTS'))
+        create_part.append(self._generate_node(node.name))
+        parts.append(' '.join(create_part))
+        
+        if node.columns:
+            parts[0] += f" ({', '.join(node.columns)})"
+        
+        parts.append(self._kw('AS'))
+        parts.append(self._generate_node(node.query))
+        
+        return self._newline().join(parts)
+
+    # ============== DROP Statement ==============
+    
+    def _gen_DropStatement(self, node) -> str:
+        """Génère un statement DROP."""
+        parts = [self._kw('DROP'), self._kw(node.object_type)]
+        if node.if_exists:
+            parts.append(self._kw('IF EXISTS'))
+        parts.append(self._generate_node(node.name))
+        if node.cascade:
+            parts.append(self._kw('CASCADE'))
+        return ' '.join(parts)
+
+    # ============== ALTER TABLE Statement ==============
+    
+    def _gen_AlterTableStatement(self, node) -> str:
+        """Génère un statement ALTER TABLE."""
+        parts = [f"{self._kw('ALTER TABLE')} {self._generate_node(node.table)}"]
+        
+        actions = []
+        for action in node.actions:
+            actions.append(self._gen_AlterTableAction(action))
+        
+        parts.append(', '.join(actions))
+        return ' '.join(parts)
+    
+    def _gen_AlterTableAction(self, node) -> str:
+        """Génère une action ALTER TABLE."""
+        if node.action_type == "ADD COLUMN":
+            return f"{self._kw('ADD COLUMN')} {self._gen_ColumnDefinition(node.column)}"
+        elif node.action_type == "DROP COLUMN":
+            return f"{self._kw('DROP COLUMN')} {node.old_name}"
+        elif node.action_type == "RENAME COLUMN":
+            return f"{self._kw('RENAME COLUMN')} {node.old_name} {self._kw('TO')} {node.new_name}"
+        elif node.action_type == "RENAME TABLE":
+            return f"{self._kw('RENAME TO')} {node.new_name}"
+        elif node.action_type == "MODIFY COLUMN":
+            return f"{self._kw('MODIFY COLUMN')} {self._gen_ColumnDefinition(node.column)}"
+        elif node.action_type == "ADD CONSTRAINT":
+            return f"{self._kw('ADD')} {self._gen_TableConstraint(node.constraint)}"
+        elif node.action_type == "DROP CONSTRAINT":
+            return f"{self._kw('DROP CONSTRAINT')} {node.old_name}"
+        else:
+            return node.action_type
+
+    # ============== TRUNCATE Statement ==============
+    
+    def _gen_TruncateStatement(self, node) -> str:
+        """Génère un statement TRUNCATE TABLE."""
+        return f"{self._kw('TRUNCATE TABLE')} {self._generate_node(node.table)}"
 
 
 def generate_sql(node: Union[ASTNode, ParseResult], 

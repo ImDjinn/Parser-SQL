@@ -13,8 +13,53 @@ from typing import List, Optional, Iterator
 class TokenType(Enum):
     """Types de tokens SQL."""
     
-    # Mots-clés
+    # Mots-clés DML
     SELECT = auto()
+    INSERT = auto()
+    UPDATE = auto()
+    DELETE = auto()
+    MERGE = auto()
+    TRUNCATE = auto()
+    
+    # Mots-clés DDL
+    CREATE = auto()
+    ALTER = auto()
+    DROP = auto()
+    TABLE = auto()
+    VIEW = auto()
+    INDEX = auto()
+    SCHEMA = auto()
+    DATABASE = auto()
+    TEMPORARY = auto()
+    TEMP = auto()
+    EXTERNAL = auto()
+    
+    # Clauses DML
+    INTO = auto()
+    VALUES = auto()
+    SET = auto()
+    MATCHED = auto()
+    
+    # Contraintes
+    PRIMARY = auto()
+    KEY = auto()
+    FOREIGN = auto()
+    REFERENCES = auto()
+    UNIQUE = auto()
+    CHECK = auto()
+    CONSTRAINT = auto()
+    DEFAULT = auto()
+    CASCADE = auto()
+    RESTRICT = auto()
+    COLUMN = auto()
+    
+    # Modificateurs
+    REPLACE = auto()
+    CONFLICT = auto()
+    NOTHING = auto()
+    DO = auto()
+    
+    # Clauses communes
     FROM = auto()
     WHERE = auto()
     AND = auto()
@@ -185,7 +230,47 @@ class SQLTokenizer:
     
     # Mots-clés SQL (insensible à la casse)
     KEYWORDS = {
+        # DML
         'select': TokenType.SELECT,
+        'insert': TokenType.INSERT,
+        'update': TokenType.UPDATE,
+        'delete': TokenType.DELETE,
+        'merge': TokenType.MERGE,
+        'truncate': TokenType.TRUNCATE,
+        # DDL
+        'create': TokenType.CREATE,
+        'alter': TokenType.ALTER,
+        'drop': TokenType.DROP,
+        'table': TokenType.TABLE,
+        'view': TokenType.VIEW,
+        'index': TokenType.INDEX,
+        'schema': TokenType.SCHEMA,
+        'database': TokenType.DATABASE,
+        'temporary': TokenType.TEMPORARY,
+        'temp': TokenType.TEMP,
+        'external': TokenType.EXTERNAL,
+        # DML clauses
+        'into': TokenType.INTO,
+        'values': TokenType.VALUES,
+        'set': TokenType.SET,
+        'matched': TokenType.MATCHED,
+        # Constraints
+        'primary': TokenType.PRIMARY,
+        'key': TokenType.KEY,
+        'foreign': TokenType.FOREIGN,
+        'references': TokenType.REFERENCES,
+        'unique': TokenType.UNIQUE,
+        'check': TokenType.CHECK,
+        'constraint': TokenType.CONSTRAINT,
+        'default': TokenType.DEFAULT,
+        'cascade': TokenType.CASCADE,
+        'restrict': TokenType.RESTRICT,
+        # Modifiers
+        'replace': TokenType.REPLACE,
+        'conflict': TokenType.CONFLICT,
+        'nothing': TokenType.NOTHING,
+        'do': TokenType.DO,
+        # Clauses communes
         'from': TokenType.FROM,
         'where': TokenType.WHERE,
         'and': TokenType.AND,
@@ -201,6 +286,7 @@ class SQLTokenizer:
         'as': TokenType.AS,
         'on': TokenType.ON,
         'using': TokenType.USING,
+        'column': TokenType.COLUMN,
         'join': TokenType.JOIN,
         'inner': TokenType.INNER,
         'left': TokenType.LEFT,
