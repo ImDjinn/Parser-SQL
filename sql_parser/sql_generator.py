@@ -478,7 +478,9 @@ class SQLGenerator:
         # WITH clause (CTEs)
         if node.ctes:
             cte_parts = [self._kw('WITH')]
-            if hasattr(node, 'recursive') and node.recursive:
+            # Check if any CTE is recursive
+            has_recursive = any(getattr(cte, 'recursive', False) for cte in node.ctes)
+            if has_recursive:
                 cte_parts.append(' ' + self._kw('RECURSIVE'))
             
             cte_defs = []
