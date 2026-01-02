@@ -289,7 +289,8 @@ class SQLGenerator:
     
     def _gen_IntervalExpression(self, node: IntervalExpression) -> str:
         """Génère une expression INTERVAL."""
-        return f"{self._kw('INTERVAL')} '{node.value}' {self._kw(node.unit)}"
+        value = self._generate_node(node.value)
+        return f"{self._kw('INTERVAL')} {value} {self._kw(node.unit)}"
     
     def _gen_AtTimeZone(self, node: AtTimeZone) -> str:
         """Génère une expression AT TIME ZONE."""
