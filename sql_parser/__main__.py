@@ -48,6 +48,12 @@ Exemples:
   
   # Parser une requête dbt avec Jinja
   python -m sql_parser --dialect athena "SELECT * FROM {{ ref('users') }}"
+  
+  # Transpiler de Presto vers PostgreSQL
+  python -m sql_parser --dialect presto --transpile postgresql "SELECT IF(x > 0, 'pos', 'neg') FROM t"
+  
+  # Transpiler de MySQL vers Presto
+  python -m sql_parser --dialect mysql --transpile presto "SELECT IFNULL(x, 0), CURDATE() FROM t"
 
 Dialectes supportés: standard, presto, athena, trino, postgresql, mysql, bigquery, snowflake, spark
 """
@@ -132,6 +138,14 @@ Dialectes supportés: standard, presto, athena, trino, postgresql, mysql, bigque
         "--lowercase",
         action="store_true",
         help="Mots-clés en minuscules (avec --generate)"
+    )
+    
+    parser.add_argument(
+        "--transpile", "-t",
+        type=str,
+        metavar="TARGET",
+        choices=['standard', 'presto', 'athena', 'trino', 'postgresql', 'mysql', 'bigquery', 'snowflake', 'spark'],
+        help="Transpiler vers un autre dialecte (ex: --dialect presto --transpile postgresql)"
     )
     
     args = parser.parse_args()
@@ -232,6 +246,50 @@ Dialectes supportés: standard, presto, athena, trino, postgresql, mysql, bigque
             print(f"SQL généré sauvegardé dans '{args.output}'")
         else:
             print(generated_sql)
+        return
+    
+    # Mode transpilation entre dialectes
+    if args.transpile:
+        from .transpiler import transpile as do_transpile
+        
+        source = dialect or SQLDialect.STANDARD
+        target_map = {
+            'standard': SQLDialect.STANDARD,
+            'presto': SQLDialect.PRESTO,
+            'athena': SQLDialect.ATHENA,
+            'trino': SQLDialect.TRINO,
+            'postgresql': SQLDialect.POSTGRESQL,
+            'mysql': SQLDialect.MYSQL,
+            'bigquery': SQLDialect.BIGQUERY,
+            'snowflake': SQLDialect.SNOWFLAKE,
+            'spark': SQLDialect.SPARK,
+        }
+        target = target_map[args.transpile]
+        
+        transpile_result = do_transpile(sql, source, target)
+        
+        if not transpile_result.success:
+            print(f"Erreur de transpilation:", file=sys.stderr)
+            for warning in transpile_result.warnings:
+                print(f"  - {warning}", file=sys.stderr)
+            sys.exit(1)
+        
+        # Afficher les warnings
+        if transpile_result.warnings:
+            print(f"-- Warnings:", file=sys.stderr)
+            for warning in transpile_result.warnings:
+                print(f"--   {warning}", file=sys.stderr)
+        
+        if transpile_result.unsupported_features:
+            print(f"-- Unsupported features:", file=sys.stderr)
+            for feature in transpile_result.unsupported_features:
+                print(f"--   {feature}", file=sys.stderr)
+        
+        if args.output:
+            Path(args.output).write_text(transpile_result.sql, encoding='utf-8')
+            print(f"SQL transpilé sauvegardé dans '{args.output}'")
+        else:
+            print(transpile_result.sql)
         return
     
     # Export JSON

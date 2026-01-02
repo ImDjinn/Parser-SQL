@@ -219,9 +219,17 @@ class SQLGenerator:
         return f"{func_str} {self._kw('OVER')} ({over_clause})"
     
     def _gen_CastExpression(self, node: CastExpression) -> str:
-        """Génère un CAST."""
+        """Génère un CAST ou TRY_CAST/SAFE_CAST."""
         expr = self._generate_node(node.expression)
-        return f"{self._kw('CAST')}({expr} {self._kw('AS')} {node.target_type})"
+        if node.is_try_cast:
+            # Use SAFE_CAST for BigQuery, TRY_CAST for Presto/Athena
+            if self.dialect == SQLDialect.BIGQUERY:
+                cast_kw = self._kw('SAFE_CAST')
+            else:
+                cast_kw = self._kw('TRY_CAST')
+        else:
+            cast_kw = self._kw('CAST')
+        return f"{cast_kw}({expr} {self._kw('AS')} {node.target_type})"
     
     def _gen_CaseExpression(self, node: CaseExpression) -> str:
         """Génère une expression CASE."""
