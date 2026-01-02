@@ -7,6 +7,7 @@ Ce module fournit:
 - Parser: Analyse syntaxique et construction de l'AST
 - Export JSON: Conversion de l'AST en JSON
 - SQL Generator: Reconstruction du SQL à partir de l'AST (réversibilité)
+- SQL Formatter: Formatage et indentation du code SQL
 - Transpiler: Traduction de SQL entre dialectes (Presto ↔ PostgreSQL ↔ MySQL ↔ BigQuery)
 - DBT Converter: Conversion de DML/DDL en modèles dbt (T-SQL → dbt Athena)
 
@@ -21,6 +22,11 @@ Usage:
     # Générer SQL <- AST (réversible)
     generator = SQLGenerator()
     sql = generator.generate(result)
+    
+    # Formater du SQL
+    from sql_parser import format_sql, minify_sql
+    formatted = format_sql("SELECT a,b,c FROM t WHERE x>1")
+    minified = minify_sql(formatted)
     
     # Transpiler entre dialectes
     result = transpile(
@@ -47,6 +53,7 @@ from .sql_generator import SQLGenerator, generate_sql
 from .dialects import SQLDialect
 from .transpiler import SQLTranspiler, transpile, TranspilationResult
 from .dbt_converter import DbtConverter, DbtModel, DbtConfig, convert_to_dbt, ConversionResult
+from .formatter import SQLFormatter, format_sql, minify_sql, validate_sql, FormatStyle, FormatOptions
 
 __version__ = "1.3.0"
 __all__ = [
