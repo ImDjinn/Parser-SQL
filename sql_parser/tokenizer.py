@@ -20,6 +20,11 @@ class TokenType(Enum):
     DELETE = auto()
     MERGE = auto()
     TRUNCATE = auto()
+    EXPLAIN = auto()
+    ANALYZE = auto()
+    VACUUM = auto()
+    GRANT = auto()
+    REVOKE = auto()
     
     # Mots-clés DDL
     CREATE = auto()
@@ -140,6 +145,7 @@ class TokenType(Enum):
     UNNEST = auto()
     ORDINALITY = auto()
     LATERAL = auto()
+    APPLY = auto()  # T-SQL: CROSS APPLY, OUTER APPLY
     TABLESAMPLE = auto()
     BERNOULLI = auto()
     SYSTEM = auto()
@@ -241,6 +247,11 @@ class SQLTokenizer:
         'delete': TokenType.DELETE,
         'merge': TokenType.MERGE,
         'truncate': TokenType.TRUNCATE,
+        'explain': TokenType.EXPLAIN,
+        'analyze': TokenType.ANALYZE,
+        'vacuum': TokenType.VACUUM,
+        'grant': TokenType.GRANT,
+        'revoke': TokenType.REVOKE,
         # DDL
         'create': TokenType.CREATE,
         'alter': TokenType.ALTER,
@@ -341,6 +352,7 @@ class SQLTokenizer:
         'unnest': TokenType.UNNEST,
         'ordinality': TokenType.ORDINALITY,
         'lateral': TokenType.LATERAL,
+        'apply': TokenType.APPLY,
         'tablesample': TokenType.TABLESAMPLE,
         'bernoulli': TokenType.BERNOULLI,
         'system': TokenType.SYSTEM,

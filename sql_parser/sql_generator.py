@@ -439,6 +439,12 @@ class SQLGenerator:
             result = node.name
         else:
             parts = []
+            # Catalog (optional, for catalog.schema.table)
+            if getattr(node, 'catalog', None):
+                catalog = node.catalog
+                if getattr(node, 'catalog_quoted', False):
+                    catalog = f'"{catalog}"'
+                parts.append(catalog)
             if node.schema:
                 schema = node.schema
                 if getattr(node, 'schema_quoted', False):
@@ -488,7 +494,11 @@ class SQLGenerator:
         join_type = node.join_type.value if node.join_type else 'INNER'
         table = self._generate_node(node.table)
         
-        result = f'{self._kw(join_type)} {self._kw("JOIN")} {table}'
+        # APPLY joins don't use the word "JOIN"
+        if node.join_type and node.join_type.value in ('CROSS APPLY', 'OUTER APPLY'):
+            result = f'{self._kw(join_type)} {table}'
+        else:
+            result = f'{self._kw(join_type)} {self._kw("JOIN")} {table}'
         
         if node.condition:
             on_expr = self._generate_node(node.condition)
@@ -697,6 +707,14 @@ class SQLGenerator:
             assigns = ', '.join(f"{a.column} = {self._generate_node(a.value)}" for a in node.update_assignments)
             parts.append(assigns)
         return ' '.join(parts)
+    
+    def _gen_ValuesStatement(self, node) -> str:
+        """Génère un statement VALUES autonome."""
+        value_rows = []
+        for row in node.rows:
+            vals = ', '.join(self._generate_node(v) for v in row)
+            value_rows.append(f"({vals})")
+        return f"{self._kw('VALUES')} {', '.join(value_rows)}"
 
     # ============== UPDATE Statement ==============
     
@@ -912,6 +930,124 @@ class SQLGenerator:
     def _gen_TruncateStatement(self, node) -> str:
         """Génère un statement TRUNCATE TABLE."""
         return f"{self._kw('TRUNCATE TABLE')} {self._generate_node(node.table)}"
+    
+    # ============== EXPLAIN Statement ==============
+    
+    def _gen_ExplainStatement(self, node) -> str:
+        """Génère un statement EXPLAIN."""
+        parts = [self._kw('EXPLAIN')]
+        
+        # Options PostgreSQL style (ANALYZE, VERBOSE, FORMAT, etc.)
+        if node.options and len(node.options) > 1:
+            # Format PostgreSQL avec parenthèses
+            opts = []
+            if node.analyze:
+                opts.append(self._kw('ANALYZE'))
+            if node.options.get('verbose'):
+                opts.append(self._kw('VERBOSE'))
+            if node.format:
+                opts.append(f"{self._kw('FORMAT')} {node.format}")
+            for key, value in node.options.items():
+                if key not in ('analyze', 'verbose', 'format'):
+                    if isinstance(value, bool):
+                        opts.append(f"{self._kw(key.upper())} {self._kw('TRUE' if value else 'FALSE')}")
+                    else:
+                        opts.append(f"{self._kw(key.upper())} {value}")
+            if opts:
+                parts.append(f"({', '.join(opts)})")
+        else:
+            # Format simple
+            if node.analyze:
+                parts.append(self._kw('ANALYZE'))
+            if node.options.get('verbose'):
+                parts.append(self._kw('VERBOSE'))
+            if node.format:
+                parts.append(f"{self._kw('FORMAT')} {node.format}")
+        
+        # Le statement à expliquer
+        parts.append(self._generate_node(node.statement))
+        
+        return ' '.join(parts)
+    
+    # ============== VACUUM Statement ==============
+    
+    def _gen_VacuumStatement(self, node) -> str:
+        """Génère un statement VACUUM."""
+        parts = [self._kw('VACUUM')]
+        
+        if node.full:
+            parts.append(self._kw('FULL'))
+        if node.freeze:
+            parts.append(self._kw('FREEZE'))
+        if node.verbose:
+            parts.append(self._kw('VERBOSE'))
+        if node.analyze:
+            parts.append(self._kw('ANALYZE'))
+        
+        if node.table:
+            parts.append(self._generate_node(node.table))
+            
+            if node.columns:
+                cols = ', '.join(node.columns)
+                parts.append(f"({cols})")
+        
+        return ' '.join(parts)
+    
+    # ============== GRANT Statement ==============
+    
+    def _gen_GrantStatement(self, node) -> str:
+        """Génère un statement GRANT."""
+        parts = [self._kw('GRANT')]
+        
+        # Privilèges
+        parts.append(', '.join(node.privileges))
+        
+        # ON object
+        if node.object_type or node.object_name:
+            parts.append(self._kw('ON'))
+            if node.object_type:
+                parts.append(self._kw(node.object_type))
+            if node.object_name:
+                parts.append(node.object_name)
+        
+        # TO grantees
+        if node.grantees:
+            parts.append(self._kw('TO'))
+            parts.append(', '.join(node.grantees))
+        
+        # WITH GRANT OPTION
+        if node.with_grant_option:
+            parts.append(self._kw('WITH GRANT OPTION'))
+        
+        return ' '.join(parts)
+    
+    # ============== REVOKE Statement ==============
+    
+    def _gen_RevokeStatement(self, node) -> str:
+        """Génère un statement REVOKE."""
+        parts = [self._kw('REVOKE')]
+        
+        # Privilèges
+        parts.append(', '.join(node.privileges))
+        
+        # ON object
+        if node.object_type or node.object_name:
+            parts.append(self._kw('ON'))
+            if node.object_type:
+                parts.append(self._kw(node.object_type))
+            if node.object_name:
+                parts.append(node.object_name)
+        
+        # FROM grantees
+        if node.grantees:
+            parts.append(self._kw('FROM'))
+            parts.append(', '.join(node.grantees))
+        
+        # CASCADE
+        if node.cascade:
+            parts.append(self._kw('CASCADE'))
+        
+        return ' '.join(parts)
 
 
 def generate_sql(node: Union[ASTNode, ParseResult], 

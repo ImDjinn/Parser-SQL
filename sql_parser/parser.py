@@ -24,11 +24,11 @@ from .ast_nodes import (
     IfExpression, JinjaExpression, WindowFunction, UnnestRef, TableSample,
     # DML statements
     InsertStatement, UpdateStatement, DeleteStatement, MergeStatement,
-    Assignment, OnConflictClause, MergeWhenClause,
+    Assignment, OnConflictClause, MergeWhenClause, ValuesStatement,
     # DDL statements
     CreateTableStatement, CreateViewStatement, DropStatement,
-    AlterTableStatement, AlterTableAction, TruncateStatement,
-    ColumnDefinition, TableConstraint
+    AlterTableStatement, AlterTableAction, TruncateStatement, ExplainStatement,
+    VacuumStatement, GrantStatement, RevokeStatement, ColumnDefinition, TableConstraint
 )
 
 
@@ -132,6 +132,31 @@ class SQLParser:
             return True
         return False
     
+    def _is_identifier_like(self) -> bool:
+        """Vérifie si le token courant peut être utilisé comme identifiant.
+        
+        Cela inclut les IDENTIFIER, QUOTED_IDENTIFIER, et certains mots-clés
+        qui peuvent être utilisés comme noms de table/colonne.
+        """
+        token = self._current()
+        if token.type in (TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER):
+            return True
+        # Mots-clés qui peuvent être utilisés comme identifiants dans certains contextes
+        # (noms de table, schéma, catalog, colonne)
+        allowed_keyword_tokens = {
+            TokenType.DEFAULT, TokenType.TABLE, TokenType.SCHEMA,
+            TokenType.DATABASE, TokenType.KEY, TokenType.COMMENT, TokenType.VIEW,
+            TokenType.INDEX, TokenType.COLUMN, TokenType.ROWS, TokenType.RANGE,
+            TokenType.PARTITION, TokenType.PRIMARY, TokenType.FOREIGN,
+        }
+        return token.type in allowed_keyword_tokens
+    
+    def _consume_identifier_like(self) -> Token:
+        """Consomme et retourne un token qui peut être utilisé comme identifiant."""
+        if self._is_identifier_like():
+            return self._advance()
+        raise SQLParserError("Expected identifier", self._current())
+
     def parse(self, sql: str) -> ParseResult:
         """
         Parse une requête SQL et retourne le résultat.
@@ -271,6 +296,21 @@ class SQLParser:
         
         elif self._check(TokenType.TRUNCATE):
             return self._parse_truncate()
+        
+        elif self._check(TokenType.VALUES):
+            return self._parse_values_statement()
+        
+        elif self._check(TokenType.EXPLAIN):
+            return self._parse_explain()
+        
+        elif self._check(TokenType.VACUUM):
+            return self._parse_vacuum()
+        
+        elif self._check(TokenType.GRANT):
+            return self._parse_grant()
+        
+        elif self._check(TokenType.REVOKE):
+            return self._parse_revoke()
         
         else:
             raise SQLParserError(f"Unexpected statement type: {current.type.name}", current)
@@ -704,9 +744,9 @@ class SQLParser:
             return TableRef(name=name, alias=alias, schema=None, is_jinja=True)
         
         # Table normale
-        # Gestion du schéma: schema.table
-        # Accepte IDENTIFIER ou QUOTED_IDENTIFIER
-        if not self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER):
+        # Gestion du schéma: schema.table ou catalog.schema.table
+        # Accepte IDENTIFIER, QUOTED_IDENTIFIER, ou certains mots-clés comme identifiants
+        if not self._is_identifier_like():
             raise SQLParserError("Expected table name", self._current())
         
         name_token = self._advance()
@@ -719,17 +759,35 @@ class SQLParser:
         if quoted and len(name) >= 2:
             name = name[1:-1]
         
+        catalog = None
+        catalog_quoted = False
+        
         if self._consume_if(TokenType.DOT):
-            # Ce qu'on avait comme "name" est en fait le schema
+            # Ce qu'on avait comme "name" est en fait le schema (ou catalog)
             schema = name
             schema_quoted = quoted
-            if not self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER):
+            if not self._is_identifier_like():
                 raise SQLParserError("Expected table name after schema", self._current())
             name_token = self._advance()
             name = name_token.value
             quoted = name_token.type == TokenType.QUOTED_IDENTIFIER
             if quoted and len(name) >= 2:
                 name = name[1:-1]
+            
+            # Check for third level: catalog.schema.table
+            if self._consume_if(TokenType.DOT):
+                # What we thought was schema is actually catalog
+                catalog = schema
+                catalog_quoted = schema_quoted
+                schema = name
+                schema_quoted = quoted
+                if not self._is_identifier_like():
+                    raise SQLParserError("Expected table name after catalog.schema", self._current())
+                name_token = self._advance()
+                name = name_token.value
+                quoted = name_token.type == TokenType.QUOTED_IDENTIFIER
+                if quoted and len(name) >= 2:
+                    name = name[1:-1]
         
         self.tables_referenced.add(name)
         
@@ -743,11 +801,11 @@ class SQLParser:
         elif self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER) and not self._is_keyword(self._current()):
             alias = self._advance().value
         
-        return TableRef(name=name, alias=alias, schema=schema, quoted=quoted, schema_quoted=schema_quoted)
+        return TableRef(name=name, alias=alias, schema=schema, catalog=catalog, quoted=quoted, schema_quoted=schema_quoted, catalog_quoted=catalog_quoted)
     
     def _parse_table_name_only(self) -> TableRef:
         """Parse un nom de table sans alias (pour CREATE TABLE, DROP TABLE, etc.)."""
-        if not self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER):
+        if not self._is_identifier_like():
             raise SQLParserError("Expected table name", self._current())
         
         name_token = self._advance()
@@ -760,19 +818,35 @@ class SQLParser:
         if quoted and len(name) >= 2:
             name = name[1:-1]
         
-        # Gestion du schéma: schema.table
+        # Gestion du schéma: schema.table ou catalog.schema.table
+        catalog = None
+        catalog_quoted = False
         if self._consume_if(TokenType.DOT):
             schema = name
             schema_quoted = quoted
-            if not self._match(TokenType.IDENTIFIER, TokenType.QUOTED_IDENTIFIER):
+            if not self._is_identifier_like():
                 raise SQLParserError("Expected table name after schema", self._current())
             name_token = self._advance()
             name = name_token.value
             quoted = name_token.type == TokenType.QUOTED_IDENTIFIER
             if quoted and len(name) >= 2:
                 name = name[1:-1]
+            
+            # Check for third level: catalog.schema.table
+            if self._consume_if(TokenType.DOT):
+                catalog = schema
+                catalog_quoted = schema_quoted
+                schema = name
+                schema_quoted = quoted
+                if not self._is_identifier_like():
+                    raise SQLParserError("Expected table name after catalog.schema", self._current())
+                name_token = self._advance()
+                name = name_token.value
+                quoted = name_token.type == TokenType.QUOTED_IDENTIFIER
+                if quoted and len(name) >= 2:
+                    name = name[1:-1]
         
-        return TableRef(name=name, alias=None, schema=schema, quoted=quoted, schema_quoted=schema_quoted)
+        return TableRef(name=name, alias=None, schema=schema, catalog=catalog, quoted=quoted, schema_quoted=schema_quoted, catalog_quoted=catalog_quoted)
     
     def _parse_unnest_ref(self) -> UnnestRef:
         """Parse UNNEST(...) [WITH ORDINALITY] (Presto/Athena)."""
@@ -877,8 +951,19 @@ class SQLParser:
                 join_type = JoinType.NATURAL
             self._expect(TokenType.JOIN)
         elif self._consume_if(TokenType.CROSS):
-            self._expect(TokenType.JOIN)
-            join_type = JoinType.CROSS
+            if self._consume_if(TokenType.APPLY):
+                # CROSS APPLY (T-SQL)
+                join_type = JoinType.CROSS_APPLY
+            else:
+                self._expect(TokenType.JOIN)
+                join_type = JoinType.CROSS
+        elif self._consume_if(TokenType.OUTER):
+            if self._consume_if(TokenType.APPLY):
+                # OUTER APPLY (T-SQL)
+                join_type = JoinType.OUTER_APPLY
+            else:
+                # OUTER alone is not valid, must be LEFT/RIGHT/FULL OUTER
+                raise SQLParserError("Expected APPLY or JOIN type before OUTER", self._current())
         elif self._consume_if(TokenType.INNER):
             self._expect(TokenType.JOIN)
             join_type = JoinType.INNER
@@ -909,7 +994,9 @@ class SQLParser:
         condition = None
         using_columns = None
         
-        if join_type != JoinType.CROSS and join_type != JoinType.NATURAL:
+        # APPLY joins and CROSS/NATURAL don't need ON/USING
+        no_condition_joins = {JoinType.CROSS, JoinType.NATURAL, JoinType.CROSS_APPLY, JoinType.OUTER_APPLY}
+        if join_type not in no_condition_joins:
             if self._consume_if(TokenType.ON):
                 condition = self._parse_expression()
             elif self._consume_if(TokenType.USING):
@@ -2708,6 +2795,324 @@ class SQLParser:
         table = self._parse_table_ref()
         
         return TruncateStatement(table=table)
+    
+    def _parse_values_statement(self) -> ValuesStatement:
+        """Parse un statement VALUES autonome: VALUES (1, 2), (3, 4)."""
+        self._expect(TokenType.VALUES)
+        
+        rows = []
+        while True:
+            self._expect(TokenType.LPAREN)
+            row = []
+            while True:
+                expr = self._parse_expression()
+                row.append(expr)
+                if not self._consume_if(TokenType.COMMA):
+                    break
+            self._expect(TokenType.RPAREN)
+            rows.append(row)
+            
+            if not self._consume_if(TokenType.COMMA):
+                break
+        
+        return ValuesStatement(rows=rows)
+    
+    # ============== EXPLAIN Statement ==============
+    
+    def _parse_explain(self) -> ExplainStatement:
+        """Parse un statement EXPLAIN: EXPLAIN [ANALYZE] [VERBOSE] [FORMAT format] statement."""
+        self._expect(TokenType.EXPLAIN)
+        
+        analyze = False
+        verbose = False
+        format_type = None
+        options = {}
+        
+        # EXPLAIN ANALYZE
+        if self._current().value.upper() == 'ANALYZE':
+            self._advance()
+            analyze = True
+        
+        # EXPLAIN VERBOSE
+        if self._current().value.upper() == 'VERBOSE':
+            self._advance()
+            verbose = True
+            options['verbose'] = True
+        
+        # PostgreSQL: EXPLAIN (options)
+        if self._check(TokenType.LPAREN):
+            self._advance()
+            while True:
+                opt_name = self._current().value.upper()
+                self._advance()
+                
+                # Certaines options ont des valeurs
+                opt_value = True
+                if opt_name in ('FORMAT', 'COSTS', 'BUFFERS', 'TIMING', 'SUMMARY', 'ANALYZE', 'VERBOSE'):
+                    if opt_name == 'FORMAT':
+                        format_type = self._current().value.upper()
+                        self._advance()
+                    elif opt_name == 'ANALYZE':
+                        analyze = True
+                    elif opt_name == 'VERBOSE':
+                        verbose = True
+                    else:
+                        # Valeur booléenne optionnelle
+                        curr_val = self._current().value.upper()
+                        if curr_val in ('TRUE', 'ON'):
+                            opt_value = True
+                            self._advance()
+                        elif curr_val in ('FALSE', 'OFF'):
+                            opt_value = False
+                            self._advance()
+                    
+                    options[opt_name.lower()] = opt_value
+                
+                if not self._consume_if(TokenType.COMMA):
+                    break
+            
+            self._expect(TokenType.RPAREN)
+        else:
+            # Syntaxe MySQL/simple: EXPLAIN FORMAT = format_name
+            if self._current().value.upper() == 'FORMAT':
+                self._advance()
+                self._consume_if(TokenType.EQUALS)
+                format_type = self._current().value.upper()
+                self._advance()
+        
+        # Parser le statement à expliquer
+        statement = self._parse_statement()
+        
+        return ExplainStatement(
+            statement=statement,
+            analyze=analyze,
+            format=format_type,
+            options=options
+        )
+    
+    # ============== VACUUM Statement ==============
+    
+    def _parse_vacuum(self) -> VacuumStatement:
+        """Parse un statement VACUUM: VACUUM [FULL] [FREEZE] [VERBOSE] [ANALYZE] [table [(columns)]]."""
+        self._expect(TokenType.VACUUM)
+        
+        full = False
+        freeze = False
+        verbose = False
+        analyze = False
+        table = None
+        columns = []
+        
+        # Options PostgreSQL
+        while not self._check(TokenType.EOF) and not self._check(TokenType.SEMICOLON):
+            curr_val = self._current().value.upper() if self._current().value else ''
+            
+            if curr_val == 'FULL':
+                full = True
+                self._advance()
+            elif curr_val == 'FREEZE':
+                freeze = True
+                self._advance()
+            elif curr_val == 'VERBOSE':
+                verbose = True
+                self._advance()
+            elif curr_val == 'ANALYZE':
+                analyze = True
+                self._advance()
+            else:
+                break
+        
+        # Table optionnelle
+        if not self._check(TokenType.EOF) and not self._check(TokenType.SEMICOLON):
+            if self._check(TokenType.IDENTIFIER) or self._check(TokenType.QUOTED_IDENTIFIER) or self._is_identifier_like():
+                table = self._parse_table_ref()
+                
+                # Colonnes optionnelles pour ANALYZE
+                if self._check(TokenType.LPAREN):
+                    self._advance()
+                    while True:
+                        col_name = self._current().value
+                        self._advance()
+                        columns.append(col_name)
+                        if not self._consume_if(TokenType.COMMA):
+                            break
+                    self._expect(TokenType.RPAREN)
+        
+        return VacuumStatement(
+            table=table,
+            full=full,
+            freeze=freeze,
+            verbose=verbose,
+            analyze=analyze,
+            columns=columns
+        )
+    
+    # ============== GRANT Statement ==============
+    
+    def _parse_grant(self) -> GrantStatement:
+        """Parse un statement GRANT: GRANT privileges ON object TO grantees [WITH GRANT OPTION]."""
+        self._expect(TokenType.GRANT)
+        
+        # Parser les privilèges
+        privileges = self._parse_privileges()
+        
+        # ON object_type object_name
+        object_type = None
+        object_name = None
+        if self._consume_if(TokenType.ON):
+            object_type, object_name = self._parse_grant_object()
+        
+        # TO grantees
+        grantees = []
+        if self._current().value.upper() == 'TO':
+            self._advance()
+            grantees = self._parse_grantees()
+        
+        # WITH GRANT OPTION
+        with_grant_option = False
+        if self._current().value.upper() == 'WITH':
+            self._advance()
+            if self._current().value.upper() == 'GRANT':
+                self._advance()
+                if self._current().value.upper() == 'OPTION':
+                    self._advance()
+                    with_grant_option = True
+        
+        return GrantStatement(
+            privileges=privileges,
+            object_type=object_type,
+            object_name=object_name,
+            grantees=grantees,
+            with_grant_option=with_grant_option
+        )
+    
+    # ============== REVOKE Statement ==============
+    
+    def _parse_revoke(self) -> RevokeStatement:
+        """Parse un statement REVOKE: REVOKE privileges ON object FROM grantees [CASCADE]."""
+        self._expect(TokenType.REVOKE)
+        
+        # Parser les privilèges
+        privileges = self._parse_privileges()
+        
+        # ON object_type object_name
+        object_type = None
+        object_name = None
+        if self._consume_if(TokenType.ON):
+            object_type, object_name = self._parse_grant_object()
+        
+        # FROM grantees
+        grantees = []
+        if self._current().value.upper() == 'FROM':
+            self._advance()
+            grantees = self._parse_grantees()
+        
+        # CASCADE
+        cascade = False
+        if not self._check(TokenType.EOF) and not self._check(TokenType.SEMICOLON):
+            if self._current().value.upper() == 'CASCADE':
+                self._advance()
+                cascade = True
+        
+        return RevokeStatement(
+            privileges=privileges,
+            object_type=object_type,
+            object_name=object_name,
+            grantees=grantees,
+            cascade=cascade
+        )
+    
+    def _parse_privileges(self) -> List[str]:
+        """Parse la liste des privilèges (SELECT, INSERT, UPDATE, DELETE, ALL, etc.)."""
+        privileges = []
+        
+        while not self._check(TokenType.EOF) and not self._check(TokenType.ON):
+            curr_val = self._current().value.upper()
+            
+            if curr_val == 'ALL':
+                self._advance()
+                if not self._check(TokenType.EOF) and self._current().value.upper() == 'PRIVILEGES':
+                    self._advance()
+                privileges.append('ALL PRIVILEGES')
+            elif curr_val in ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 
+                              'REFERENCES', 'TRIGGER', 'USAGE', 'CREATE', 'CONNECT',
+                              'TEMPORARY', 'TEMP', 'EXECUTE', 'ALTER', 'DROP', 'INDEX'):
+                privileges.append(curr_val)
+                self._advance()
+            else:
+                break
+            
+            # Consommer la virgule optionnelle
+            self._consume_if(TokenType.COMMA)
+        
+        return privileges
+    
+    def _parse_grant_object(self) -> tuple:
+        """Parse le type et le nom de l'objet pour GRANT/REVOKE."""
+        object_type = None
+        object_name = None
+        
+        curr_val = self._current().value.upper()
+        
+        # Object type optionnel
+        if curr_val in ('TABLE', 'VIEW', 'SCHEMA', 'DATABASE', 'SEQUENCE', 
+                        'FUNCTION', 'PROCEDURE', 'TYPE', 'DOMAIN', 'TABLESPACE',
+                        'FOREIGN', 'SERVER', 'LANGUAGE', 'ROLE'):
+            object_type = curr_val
+            self._advance()
+            
+            # FOREIGN DATA WRAPPER ou FOREIGN SERVER
+            if object_type == 'FOREIGN':
+                if self._current().value.upper() == 'DATA':
+                    self._advance()
+                    if self._current().value.upper() == 'WRAPPER':
+                        self._advance()
+                        object_type = 'FOREIGN DATA WRAPPER'
+                elif self._current().value.upper() == 'SERVER':
+                    self._advance()
+                    object_type = 'FOREIGN SERVER'
+        
+        # Nom de l'objet
+        if not self._check(TokenType.EOF):
+            parts = []
+            parts.append(self._current().value)
+            self._advance()
+            
+            # Gérer schema.table
+            while self._consume_if(TokenType.DOT):
+                parts.append(self._current().value)
+                self._advance()
+            
+            object_name = '.'.join(parts)
+        
+        return object_type, object_name
+    
+    def _parse_grantees(self) -> List[str]:
+        """Parse la liste des bénéficiaires (utilisateurs, rôles, PUBLIC, etc.)."""
+        grantees = []
+        
+        while not self._check(TokenType.EOF) and not self._check(TokenType.SEMICOLON):
+            curr_val = self._current().value
+            
+            if curr_val.upper() in ('WITH', 'CASCADE', 'RESTRICT'):
+                break
+            
+            if curr_val.upper() == 'PUBLIC':
+                grantees.append('PUBLIC')
+            elif curr_val.upper() in ('GROUP', 'ROLE'):
+                prefix = curr_val.upper()
+                self._advance()
+                if not self._check(TokenType.EOF):
+                    grantees.append(f"{prefix} {self._current().value}")
+            else:
+                grantees.append(curr_val)
+            
+            self._advance()
+            
+            if not self._consume_if(TokenType.COMMA):
+                break
+        
+        return grantees
 
 
 def parse(sql: str, dialect: SQLDialect = None) -> ParseResult:

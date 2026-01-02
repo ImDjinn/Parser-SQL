@@ -53,6 +53,8 @@ class JoinType(Enum):
     CROSS = "CROSS"
     NATURAL = "NATURAL"
     LATERAL = "LATERAL"  # Presto/Athena
+    CROSS_APPLY = "CROSS APPLY"  # T-SQL
+    OUTER_APPLY = "OUTER APPLY"  # T-SQL
 
 
 class OrderDirection(Enum):
@@ -642,9 +644,11 @@ class TableRef(ASTNode):
     name: str
     alias: Optional[str] = None
     schema: Optional[str] = None
+    catalog: Optional[str] = None  # For catalog.schema.table syntax
     is_jinja: bool = False  # True si c'est un template Jinja (dbt: {{ ref('...') }})
     quoted: bool = False    # True si le nom est entre guillemets
     schema_quoted: bool = False  # True si le schema est entre guillemets
+    catalog_quoted: bool = False  # True si le catalog est entre guillemets
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -655,12 +659,16 @@ class TableRef(ASTNode):
             result["alias"] = self.alias
         if self.schema:
             result["schema"] = self.schema
+        if self.catalog:
+            result["catalog"] = self.catalog
         if self.is_jinja:
             result["is_jinja"] = True
         if self.quoted:
             result["quoted"] = True
         if self.schema_quoted:
             result["schema_quoted"] = True
+        if self.catalog_quoted:
+            result["catalog_quoted"] = True
         return result
 
 
@@ -979,6 +987,18 @@ class InsertStatement(ASTNode):
         if self.on_conflict:
             result["on_conflict"] = self.on_conflict.to_dict()
         return result
+
+
+@dataclass
+class ValuesStatement(ASTNode):
+    """Statement VALUES autonome (ex: VALUES (1, 2), (3, 4))."""
+    rows: List[List[Expression]]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "ValuesStatement",
+            "rows": [[v.to_dict() for v in row] for row in self.rows]
+        }
 
 
 @dataclass
@@ -1306,6 +1326,98 @@ class TruncateStatement(ASTNode):
             "node_type": "TruncateStatement",
             "table": self.table.to_dict()
         }
+
+
+@dataclass
+class ExplainStatement(ASTNode):
+    """Statement EXPLAIN [ANALYZE] <statement>."""
+    statement: ASTNode
+    analyze: bool = False
+    format: Optional[str] = None  # TEXT, JSON, XML, YAML
+    options: Dict[str, Any] = field(default_factory=dict)  # PostgreSQL options
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "ExplainStatement",
+            "statement": self.statement.to_dict(),
+            "analyze": self.analyze
+        }
+        if self.format:
+            result["format"] = self.format
+        if self.options:
+            result["options"] = self.options
+        return result
+
+
+@dataclass
+class VacuumStatement(ASTNode):
+    """Statement VACUUM [FULL] [FREEZE] [VERBOSE] [ANALYZE] [table]."""
+    table: Optional['TableRef'] = None
+    full: bool = False
+    freeze: bool = False
+    verbose: bool = False
+    analyze: bool = False
+    columns: List[str] = field(default_factory=list)  # ANALYZE columns
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "VacuumStatement",
+            "full": self.full,
+            "freeze": self.freeze,
+            "verbose": self.verbose,
+            "analyze": self.analyze
+        }
+        if self.table:
+            result["table"] = self.table.to_dict()
+        if self.columns:
+            result["columns"] = self.columns
+        return result
+
+
+@dataclass
+class GrantStatement(ASTNode):
+    """Statement GRANT privileges ON object TO grantees."""
+    privileges: List[str]  # SELECT, INSERT, UPDATE, DELETE, ALL PRIVILEGES, etc.
+    object_type: Optional[str] = None  # TABLE, VIEW, SCHEMA, DATABASE, etc.
+    object_name: Optional[str] = None  # Nom de l'objet
+    grantees: List[str] = field(default_factory=list)  # Utilisateurs/rôles
+    with_grant_option: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "GrantStatement",
+            "privileges": self.privileges,
+            "grantees": self.grantees,
+            "with_grant_option": self.with_grant_option
+        }
+        if self.object_type:
+            result["object_type"] = self.object_type
+        if self.object_name:
+            result["object_name"] = self.object_name
+        return result
+
+
+@dataclass
+class RevokeStatement(ASTNode):
+    """Statement REVOKE privileges ON object FROM grantees."""
+    privileges: List[str]  # SELECT, INSERT, UPDATE, DELETE, ALL PRIVILEGES, etc.
+    object_type: Optional[str] = None  # TABLE, VIEW, SCHEMA, DATABASE, etc.
+    object_name: Optional[str] = None  # Nom de l'objet
+    grantees: List[str] = field(default_factory=list)  # Utilisateurs/rôles
+    cascade: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {
+            "node_type": "RevokeStatement",
+            "privileges": self.privileges,
+            "grantees": self.grantees,
+            "cascade": self.cascade
+        }
+        if self.object_type:
+            result["object_type"] = self.object_type
+        if self.object_name:
+            result["object_name"] = self.object_name
+        return result
 
 
 # ============== Informations de parsing ==============
