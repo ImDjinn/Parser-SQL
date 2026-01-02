@@ -171,6 +171,12 @@ class SQLGenerator:
     
     def _gen_FunctionCall(self, node: FunctionCall) -> str:
         """Génère un appel de fonction."""
+        # Handle special transpiler markers
+        if node.name == '__TSQL_VALUES__':
+            # Convert to T-SQL VALUES format: (SELECT value FROM (VALUES (1),(2),(3)) AS t(value))
+            values = ', '.join(f'({self._generate_node(arg)})' for arg in node.args)
+            return f"(SELECT value FROM (VALUES {values}) AS t(value))"
+        
         name = node.name.upper() if self.uppercase_keywords else node.name.lower()
         
         args_parts = []
@@ -504,6 +510,10 @@ class SQLGenerator:
         select_parts = [self._kw('SELECT')]
         if node.distinct:
             select_parts.append(' ' + self._kw('DISTINCT'))
+            # DISTINCT ON (PostgreSQL specific)
+            if node.distinct_on:
+                on_exprs = ', '.join(self._generate_node(e) for e in node.distinct_on)
+                select_parts.append(f' {self._kw("ON")} ({on_exprs})')
         
         items = [self._generate_node(item) for item in node.select_items]
         if self.inline:

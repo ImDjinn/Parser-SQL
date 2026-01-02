@@ -428,10 +428,24 @@ class SQLParser:
         """Parse une requête SELECT."""
         self._expect(TokenType.SELECT)
         
-        # DISTINCT
-        distinct = self._consume_if(TokenType.DISTINCT)
-        if not distinct:
-            self._consume_if(TokenType.ALL)  # ALL est le comportement par défaut
+        # DISTINCT / DISTINCT ON (PostgreSQL)
+        distinct = False
+        distinct_on = None
+        
+        if self._consume_if(TokenType.DISTINCT):
+            distinct = True
+            # Check for DISTINCT ON (col1, col2, ...) - PostgreSQL specific
+            if self._check(TokenType.ON):
+                self._advance()  # consume ON
+                self._expect(TokenType.LPAREN)
+                distinct_on = []
+                while True:
+                    distinct_on.append(self._parse_expression())
+                    if not self._consume_if(TokenType.COMMA):
+                        break
+                self._expect(TokenType.RPAREN)
+        elif not self._consume_if(TokenType.ALL):
+            pass  # ALL est le comportement par défaut
         
         # Liste des colonnes
         select_items = self._parse_select_items()
@@ -493,7 +507,8 @@ class SQLParser:
             order_by=order_by,
             limit=limit,
             offset=offset,
-            distinct=distinct
+            distinct=distinct,
+            distinct_on=distinct_on
         )
         
         # UNION, INTERSECT, EXCEPT

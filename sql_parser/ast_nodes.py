@@ -739,6 +739,7 @@ class SelectStatement(ASTNode):
     limit: Optional[Expression] = None
     offset: Optional[Expression] = None
     distinct: bool = False
+    distinct_on: Optional[List[Expression]] = None  # PostgreSQL DISTINCT ON (col1, col2)
     ctes: Optional[List[CTEDefinition]] = None
     metadata: Optional[Dict[str, Any]] = None  # Jinja config, etc.
     
@@ -754,6 +755,9 @@ class SelectStatement(ASTNode):
         
         if self.distinct:
             result["distinct"] = True
+        
+        if self.distinct_on:
+            result["distinct_on"] = [expr.to_dict() for expr in self.distinct_on]
         
         if self.metadata:
             result["metadata"] = self.metadata
