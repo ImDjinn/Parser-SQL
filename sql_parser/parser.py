@@ -201,11 +201,17 @@ class SQLParser:
     def _parse_statement(self) -> SelectStatement:
         """Parse un statement SQL (pour l'instant, uniquement SELECT)."""
         # Consommer les templates Jinja de configuration au début (dbt)
-        jinja_config = []
+        jinja_config_raw = []
+        parsed_config = {}
+        
         while self._match(TokenType.JINJA_EXPR, TokenType.JINJA_STMT, TokenType.JINJA_COMMENT):
             token = self._advance()
             if token.type in (TokenType.JINJA_EXPR, TokenType.JINJA_STMT):
-                jinja_config.append(token.value)
+                jinja_config_raw.append(token.value)
+                # Parser la config dbt
+                config = self._parse_dbt_config(token.value)
+                if config:
+                    parsed_config.update(config)
             self.has_jinja = True
         
         # Gestion des CTE (WITH clause)
@@ -217,12 +223,116 @@ class SQLParser:
             statement = self._parse_select()
             statement.ctes = ctes
             # Stocker les configurations Jinja comme métadonnées
-            if jinja_config:
+            if jinja_config_raw or parsed_config:
                 statement.metadata = statement.metadata or {}
-                statement.metadata["jinja_config"] = jinja_config
+                if jinja_config_raw:
+                    statement.metadata["jinja_config_raw"] = jinja_config_raw
+                if parsed_config:
+                    statement.metadata["dbt_config"] = parsed_config
             return statement
         else:
             raise SQLParserError("Expected SELECT statement", self._current())
+    
+    def _parse_dbt_config(self, jinja_content: str) -> dict:
+        """
+        Parse le contenu d'un template Jinja dbt pour extraire la configuration.
+        
+        Supporte:
+        - {{ config(...) }}
+        - {{ ref('table') }}
+        - {{ source('schema', 'table') }}
+        - {{ var('name') }}
+        
+        Returns:
+            dict avec les paramètres extraits ou None
+        """
+        import re
+        
+        result = {}
+        
+        # Nettoyer le contenu (retirer {{ }} ou {% %})
+        content = jinja_content.strip()
+        if content.startswith('{{') and content.endswith('}}'):
+            content = content[2:-2].strip()
+        elif content.startswith('{%') and content.endswith('%}'):
+            content = content[2:-2].strip()
+        
+        # Parser config(...)
+        config_match = re.match(r'config\s*\((.*)\)\s*$', content, re.DOTALL)
+        if config_match:
+            config_content = config_match.group(1).strip()
+            result = self._parse_python_kwargs(config_content)
+            return result
+        
+        # Parser ref('table') ou ref('schema', 'table')
+        ref_match = re.match(r"ref\s*\(\s*['\"]([^'\"]+)['\"]\s*(?:,\s*['\"]([^'\"]+)['\"])?\s*\)", content)
+        if ref_match:
+            if ref_match.group(2):
+                return {"_type": "ref", "schema": ref_match.group(1), "table": ref_match.group(2)}
+            return {"_type": "ref", "table": ref_match.group(1)}
+        
+        # Parser source('schema', 'table')
+        source_match = re.match(r"source\s*\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)", content)
+        if source_match:
+            return {"_type": "source", "schema": source_match.group(1), "table": source_match.group(2)}
+        
+        # Parser var('name')
+        var_match = re.match(r"var\s*\(\s*['\"]([^'\"]+)['\"]\s*\)", content)
+        if var_match:
+            return {"_type": "var", "name": var_match.group(1)}
+        
+        return None
+    
+    def _parse_python_kwargs(self, content: str) -> dict:
+        """
+        Parse des kwargs Python simples: key='value', key=True, key=['a', 'b']
+        
+        Returns:
+            dict avec les paramètres parsés
+        """
+        import re
+        
+        result = {}
+        
+        # Regex pour capturer key=value patterns
+        # Supporte: string, bool, int, list simple
+        patterns = [
+            # key='string' ou key="string"
+            (r"(\w+)\s*=\s*['\"]([^'\"]*)['\"]", lambda m: (m.group(1), m.group(2))),
+            # key=True ou key=False
+            (r"(\w+)\s*=\s*(True|False)", lambda m: (m.group(1), m.group(2) == 'True')),
+            # key=123
+            (r"(\w+)\s*=\s*(\d+)", lambda m: (m.group(1), int(m.group(2)))),
+            # key=None
+            (r"(\w+)\s*=\s*None", lambda m: (m.group(1), None)),
+        ]
+        
+        for pattern, extractor in patterns:
+            for match in re.finditer(pattern, content):
+                key, value = extractor(match)
+                result[key] = value
+        
+        # Parser les listes: key=['a', 'b', 'c']
+        list_pattern = r"(\w+)\s*=\s*\[([^\]]*)\]"
+        for match in re.finditer(list_pattern, content):
+            key = match.group(1)
+            list_content = match.group(2)
+            # Extraire les éléments de la liste
+            items = re.findall(r"['\"]([^'\"]*)['\"]", list_content)
+            if items:
+                result[key] = items
+        
+        # Parser les dicts simples: key={'a': 'b'}
+        dict_pattern = r"(\w+)\s*=\s*\{([^\}]*)\}"
+        for match in re.finditer(dict_pattern, content):
+            key = match.group(1)
+            dict_content = match.group(2)
+            # Extraire les paires clé-valeur
+            pairs = re.findall(r"['\"]([^'\"]*)['\"]:\s*['\"]([^'\"]*)['\"]", dict_content)
+            if pairs:
+                result[key] = dict(pairs)
+        
+        return result
     
     def _parse_cte_list(self) -> List[CTEDefinition]:
         """Parse la liste des CTEs."""
