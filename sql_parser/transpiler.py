@@ -471,6 +471,252 @@ class MySQLToPrestoTransformer(DialectTransformer):
         return node
 
 
+class TSQLToPrestoTransformer(DialectTransformer):
+    """Transform T-SQL (SQL Server) to Presto/Athena."""
+    
+    FUNCTION_MAP = {
+        'ISNULL': 'COALESCE',
+        'LEN': 'LENGTH',
+        'CHARINDEX': 'STRPOS',  # Arguments reversed
+        'GETDATE': 'CURRENT_TIMESTAMP',
+        'GETUTCDATE': 'CURRENT_TIMESTAMP',
+        'NEWID': 'UUID',
+        'DATEPART': None,  # Needs EXTRACT transformation
+        'DATEDIFF': 'DATE_DIFF',  # Argument order: unit, start, end
+        'DATEADD': 'DATE_ADD',  # Argument order: unit, value, date
+        'CONVERT': None,  # -> CAST
+        'STR': 'CAST',  # STR(num) -> CAST(num AS VARCHAR)
+        'STUFF': None,  # Complex transformation
+        'REPLICATE': 'REPEAT',
+        'SPACE': None,  # SPACE(n) -> REPEAT(' ', n)
+        'LEFT': None,  # LEFT(s, n) -> SUBSTR(s, 1, n)
+        'RIGHT': None,  # RIGHT(s, n) -> SUBSTR(s, LENGTH(s)-n+1, n)
+        'STRING_SPLIT': 'SPLIT',
+        'STRING_AGG': 'LISTAGG',
+    }
+    
+    def _apply_transformation(self, node: ASTNode) -> ASTNode:
+        if isinstance(node, FunctionCall):
+            return self._transform_function(node)
+        elif isinstance(node, IfExpression):
+            # T-SQL IIF is parsed as IfExpression, keep it
+            return node
+        return node
+    
+    def _transform_function(self, node: FunctionCall) -> ASTNode:
+        func_name = node.name.upper()
+        
+        # Special transformations
+        if func_name == 'IIF':
+            # IIF(cond, then, else) is same as IF() in Presto
+            return IfExpression(
+                condition=node.args[0] if len(node.args) > 0 else None,
+                then_expr=node.args[1] if len(node.args) > 1 else None,
+                else_expr=node.args[2] if len(node.args) > 2 else None
+            )
+        
+        if func_name == 'CHARINDEX' and len(node.args) >= 2:
+            # CHARINDEX(substr, str) -> STRPOS(str, substr)
+            node.name = 'STRPOS'
+            node.args = [node.args[1], node.args[0]]
+            return node
+        
+        if func_name == 'LEFT' and len(node.args) >= 2:
+            # LEFT(str, n) -> SUBSTR(str, 1, n)
+            return FunctionCall(
+                name='SUBSTR',
+                args=[node.args[0], Literal(1, 'INTEGER'), node.args[1]]
+            )
+        
+        if func_name == 'RIGHT' and len(node.args) >= 2:
+            # RIGHT(str, n) -> SUBSTR(str, LENGTH(str) - n + 1, n)
+            str_expr = node.args[0]
+            n_expr = node.args[1]
+            start = BinaryOp(
+                left=BinaryOp(
+                    left=FunctionCall(name='LENGTH', args=[str_expr]),
+                    operator='-',
+                    right=n_expr
+                ),
+                operator='+',
+                right=Literal(1, 'INTEGER')
+            )
+            return FunctionCall(name='SUBSTR', args=[str_expr, start, n_expr])
+        
+        if func_name == 'SPACE' and len(node.args) >= 1:
+            # SPACE(n) -> REPEAT(' ', n)
+            return FunctionCall(
+                name='REPEAT',
+                args=[Literal(' ', 'STRING'), node.args[0]]
+            )
+        
+        if func_name == 'CONVERT' and len(node.args) >= 2:
+            # CONVERT(type, expr) -> CAST(expr AS type)
+            target_type = node.args[0]
+            expr = node.args[1]
+            type_str = target_type.name if isinstance(target_type, Identifier) else str(target_type)
+            return CastExpression(expression=expr, target_type=type_str.upper())
+        
+        # Direct function mapping
+        if func_name in self.FUNCTION_MAP:
+            new_name = self.FUNCTION_MAP[func_name]
+            if new_name:
+                node.name = new_name
+        
+        return node
+
+
+class TSQLToPostgreSQLTransformer(DialectTransformer):
+    """Transform T-SQL (SQL Server) to PostgreSQL."""
+    
+    FUNCTION_MAP = {
+        'ISNULL': 'COALESCE',
+        'LEN': 'LENGTH',
+        'CHARINDEX': 'POSITION',  # Different syntax: POSITION(substr IN str)
+        'GETDATE': 'NOW',
+        'GETUTCDATE': 'NOW',
+        'NEWID': 'GEN_RANDOM_UUID',
+        'DATEDIFF': None,  # Complex transformation
+        'DATEADD': None,  # -> date + interval
+        'REPLICATE': 'REPEAT',
+        'STRING_SPLIT': 'STRING_TO_ARRAY',
+        'STRING_AGG': 'STRING_AGG',
+    }
+    
+    def _apply_transformation(self, node: ASTNode) -> ASTNode:
+        if isinstance(node, FunctionCall):
+            return self._transform_function(node)
+        elif isinstance(node, IfExpression):
+            return self._transform_if(node)
+        return node
+    
+    def _transform_if(self, node: IfExpression) -> CaseExpression:
+        """Transform IIF/IF to CASE WHEN for PostgreSQL."""
+        else_value = node.else_expr if node.else_expr else Literal(None, 'NULL')
+        return CaseExpression(
+            operand=None,
+            when_clauses=[(node.condition, node.then_expr)],
+            else_clause=else_value
+        )
+    
+    def _transform_function(self, node: FunctionCall) -> ASTNode:
+        func_name = node.name.upper()
+        
+        # IIF -> CASE WHEN
+        if func_name == 'IIF' and len(node.args) >= 3:
+            return CaseExpression(
+                operand=None,
+                when_clauses=[(node.args[0], node.args[1])],
+                else_clause=node.args[2]
+            )
+        
+        if func_name == 'CHARINDEX' and len(node.args) >= 2:
+            # CHARINDEX(substr, str) -> POSITION(substr IN str)
+            # PostgreSQL syntax is special, use STRPOS as alternative
+            node.name = 'STRPOS'
+            node.args = [node.args[1], node.args[0]]
+            return node
+        
+        if func_name == 'LEFT' and len(node.args) >= 2:
+            # LEFT(str, n) -> SUBSTRING(str, 1, n)
+            return FunctionCall(
+                name='SUBSTRING',
+                args=[node.args[0], Literal(1, 'INTEGER'), node.args[1]]
+            )
+        
+        if func_name == 'RIGHT' and len(node.args) >= 2:
+            # RIGHT(str, n) -> SUBSTRING(str FROM LENGTH(str) - n + 1)
+            str_expr = node.args[0]
+            n_expr = node.args[1]
+            start = BinaryOp(
+                left=BinaryOp(
+                    left=FunctionCall(name='LENGTH', args=[str_expr]),
+                    operator='-',
+                    right=n_expr
+                ),
+                operator='+',
+                right=Literal(1, 'INTEGER')
+            )
+            return FunctionCall(name='SUBSTRING', args=[str_expr, start, n_expr])
+        
+        if func_name == 'SPACE' and len(node.args) >= 1:
+            return FunctionCall(
+                name='REPEAT',
+                args=[Literal(' ', 'STRING'), node.args[0]]
+            )
+        
+        # Direct function mapping
+        if func_name in self.FUNCTION_MAP:
+            new_name = self.FUNCTION_MAP[func_name]
+            if new_name:
+                node.name = new_name
+        
+        return node
+
+
+class PrestoToTSQLTransformer(DialectTransformer):
+    """Transform Presto/Athena to T-SQL (SQL Server)."""
+    
+    FUNCTION_MAP = {
+        'COALESCE': 'ISNULL',  # Can keep COALESCE too, but ISNULL is more T-SQL
+        'LENGTH': 'LEN',
+        'STRPOS': 'CHARINDEX',  # Arguments reversed
+        'SUBSTR': 'SUBSTRING',
+        'CURRENT_TIMESTAMP': 'GETDATE',
+        'CURRENT_DATE': 'CAST',  # CAST(GETDATE() AS DATE)
+        'UUID': 'NEWID',
+        'LISTAGG': 'STRING_AGG',
+        'REPEAT': 'REPLICATE',
+        'SPLIT': 'STRING_SPLIT',
+        'CARDINALITY': None,  # No direct equivalent
+        'ARRAY_AGG': None,  # No direct equivalent
+    }
+    
+    def _apply_transformation(self, node: ASTNode) -> ASTNode:
+        if isinstance(node, FunctionCall):
+            return self._transform_function(node)
+        elif isinstance(node, IfExpression):
+            return self._transform_if(node)
+        elif isinstance(node, ArrayExpression):
+            self.unsupported.append("Arrays not directly supported in T-SQL")
+            return node
+        elif isinstance(node, LambdaExpression):
+            self.unsupported.append("Lambda expressions not supported in T-SQL")
+            return node
+        return node
+    
+    def _transform_if(self, node: IfExpression) -> FunctionCall:
+        """Transform IF() to IIF() for T-SQL."""
+        return FunctionCall(
+            name='IIF',
+            args=[node.condition, node.then_expr, node.else_expr or Literal(None, 'NULL')]
+        )
+    
+    def _transform_function(self, node: FunctionCall) -> ASTNode:
+        func_name = node.name.upper()
+        
+        if func_name == 'STRPOS' and len(node.args) >= 2:
+            # STRPOS(str, substr) -> CHARINDEX(substr, str)
+            node.name = 'CHARINDEX'
+            node.args = [node.args[1], node.args[0]]
+            return node
+        
+        if func_name == 'CURRENT_DATE':
+            # CURRENT_DATE -> CAST(GETDATE() AS DATE)
+            return CastExpression(
+                expression=FunctionCall(name='GETDATE', args=[]),
+                target_type='DATE'
+            )
+        
+        # Direct function mapping
+        if func_name in self.FUNCTION_MAP:
+            new_name = self.FUNCTION_MAP[func_name]
+            if new_name and new_name != 'CAST':  # Skip CAST special handling
+                node.name = new_name
+        
+        return node
+
+
 class SQLTranspiler:
     """Main transpiler class for converting SQL between dialects."""
     
@@ -487,6 +733,15 @@ class SQLTranspiler:
         (SQLDialect.POSTGRESQL, SQLDialect.ATHENA): PostgreSQLToPrestoTransformer,
         (SQLDialect.MYSQL, SQLDialect.PRESTO): MySQLToPrestoTransformer,
         (SQLDialect.MYSQL, SQLDialect.ATHENA): MySQLToPrestoTransformer,
+        # T-SQL (SQL Server) conversions
+        (SQLDialect.TSQL, SQLDialect.PRESTO): TSQLToPrestoTransformer,
+        (SQLDialect.TSQL, SQLDialect.ATHENA): TSQLToPrestoTransformer,
+        (SQLDialect.TSQL, SQLDialect.POSTGRESQL): TSQLToPostgreSQLTransformer,
+        (SQLDialect.TSQL, SQLDialect.MYSQL): TSQLToPrestoTransformer,  # Similar transformations
+        (SQLDialect.PRESTO, SQLDialect.TSQL): PrestoToTSQLTransformer,
+        (SQLDialect.ATHENA, SQLDialect.TSQL): PrestoToTSQLTransformer,
+        (SQLDialect.POSTGRESQL, SQLDialect.TSQL): PrestoToTSQLTransformer,  # Via similar transformations
+        (SQLDialect.MYSQL, SQLDialect.TSQL): PrestoToTSQLTransformer,  # Via similar transformations
     }
     
     def transpile(

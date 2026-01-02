@@ -20,6 +20,7 @@ class SQLDialect(Enum):
     BIGQUERY = "bigquery"      # Google BigQuery
     SNOWFLAKE = "snowflake"    # Snowflake
     SPARK = "spark"            # Spark SQL
+    TSQL = "tsql"              # T-SQL (SQL Server)
 
 
 @dataclass
@@ -85,6 +86,91 @@ class DialectFeatures:
     
     # Supporte les window functions avec OVER
     supports_window_functions: bool = True
+    
+    # Supporte TOP N (T-SQL)
+    supports_top: bool = False
+    
+    # Supporte les crochets pour identifiants [column]
+    supports_bracket_identifiers: bool = False
+    
+    # Supporte les variables @variable
+    supports_at_variables: bool = False
+    
+    # Supporte CONVERT (T-SQL)
+    supports_convert: bool = False
+    
+    # Supporte IIF (T-SQL)
+    supports_iif: bool = False
+
+
+# Fonctions T-SQL (SQL Server)
+TSQL_FUNCTIONS = {
+    # Fonctions d'agrégation
+    'avg', 'count', 'count_big', 'max', 'min', 'sum', 'stdev', 'stdevp',
+    'var', 'varp', 'grouping', 'grouping_id', 'string_agg',
+    
+    # Fonctions de chaîne
+    'ascii', 'char', 'charindex', 'concat', 'concat_ws', 'datalength',
+    'difference', 'format', 'left', 'len', 'lower', 'ltrim', 'nchar',
+    'patindex', 'quotename', 'replace', 'replicate', 'reverse', 'right',
+    'rtrim', 'soundex', 'space', 'str', 'string_escape', 'string_split',
+    'stuff', 'substring', 'translate', 'trim', 'unicode', 'upper',
+    
+    # Fonctions de date/heure
+    'current_timestamp', 'dateadd', 'datediff', 'datediff_big', 'datefromparts',
+    'datename', 'datepart', 'datetime2fromparts', 'datetimefromparts',
+    'datetimeoffsetfromparts', 'day', 'eomonth', 'getdate', 'getutcdate',
+    'isdate', 'month', 'smalldatetimefromparts', 'switchoffset', 'sysdatetime',
+    'sysdatetimeoffset', 'sysutcdatetime', 'timefromparts', 'todatetimeoffset',
+    'year',
+    
+    # Fonctions de conversion
+    'cast', 'convert', 'parse', 'try_cast', 'try_convert', 'try_parse',
+    
+    # Fonctions conditionnelles
+    'coalesce', 'iif', 'isnull', 'nullif', 'choose',
+    
+    # Fonctions mathématiques
+    'abs', 'acos', 'asin', 'atan', 'atn2', 'ceiling', 'cos', 'cot',
+    'degrees', 'exp', 'floor', 'log', 'log10', 'pi', 'power', 'radians',
+    'rand', 'round', 'sign', 'sin', 'sqrt', 'square', 'tan',
+    
+    # Fonctions de fenêtre
+    'row_number', 'rank', 'dense_rank', 'ntile', 'lag', 'lead',
+    'first_value', 'last_value', 'cume_dist', 'percent_rank',
+    'percentile_cont', 'percentile_disc',
+    
+    # Fonctions JSON
+    'isjson', 'json_value', 'json_query', 'json_modify', 'json_path_exists',
+    
+    # Autres
+    'newid', 'newsequentialid', 'rowcount_big', 'scope_identity',
+    'serverproperty', 'sessionproperty', 'session_user', 'system_user',
+    'user_name', 'host_name', 'db_name', 'object_id', 'object_name',
+}
+
+# Types de données T-SQL
+TSQL_DATA_TYPES = {
+    'bigint', 'int', 'smallint', 'tinyint', 'bit',
+    'decimal', 'numeric', 'money', 'smallmoney',
+    'float', 'real',
+    'date', 'time', 'datetime', 'datetime2', 'smalldatetime', 'datetimeoffset',
+    'char', 'varchar', 'text', 'nchar', 'nvarchar', 'ntext',
+    'binary', 'varbinary', 'image',
+    'uniqueidentifier', 'xml', 'sql_variant',
+    'geography', 'geometry', 'hierarchyid',
+}
+
+# Mots-clés T-SQL
+TSQL_KEYWORDS = {
+    'top', 'percent', 'with', 'ties', 'offset', 'fetch', 'next', 'only',
+    'identity', 'rowguidcol', 'filestream', 'sparse', 'not', 'for', 'replication',
+    'go', 'use', 'exec', 'execute', 'sp_executesql', 'print', 'raiserror',
+    'throw', 'try', 'catch', 'begin', 'end', 'if', 'else', 'while',
+    'break', 'continue', 'return', 'goto', 'waitfor', 'declare', 'set',
+    'output', 'inserted', 'deleted', 'merge', 'matched', 'pivot', 'unpivot',
+    'cross', 'apply', 'outer', 'openrowset', 'openquery', 'opendatasource',
+}
 
 
 # Fonctions communes Presto/Athena/Trino
@@ -258,6 +344,22 @@ def get_dialect_features(dialect: SQLDialect) -> DialectFeatures:
             supports_backtick_identifiers=True,
         )
     
+    elif dialect == SQLDialect.TSQL:
+        return DialectFeatures(
+            name="T-SQL (SQL Server)",
+            functions=TSQL_FUNCTIONS,
+            data_types=TSQL_DATA_TYPES,
+            keywords=TSQL_KEYWORDS,
+            supports_window_functions=True,
+            supports_grouping_sets=True,
+            identifier_quote='"',
+            supports_bracket_identifiers=True,
+            supports_at_variables=True,
+            supports_convert=True,
+            supports_iif=True,
+            supports_top=True,
+        )
+    
     return DialectFeatures(name="Unknown")
 
 
@@ -304,5 +406,17 @@ def detect_dialect(sql: str) -> SQLDialect:
     # Détection PostgreSQL
     if '::' in sql or 'generate_series' in sql_lower:
         return SQLDialect.POSTGRESQL
+    
+    # Détection T-SQL (SQL Server)
+    tsql_indicators = [
+        'getdate()', 'isnull(', 'charindex(', 'len(', 'dateadd(',
+        'datediff(', 'convert(', 'iif(', 'top ', 'with (nolock)',
+        'identity(', 'scope_identity', 'newid()', '@@',
+    ]
+    if any(ind in sql_lower for ind in tsql_indicators):
+        return SQLDialect.TSQL
+    # Also check for [bracket] identifiers
+    if '[' in sql and ']' in sql:
+        return SQLDialect.TSQL
     
     return SQLDialect.STANDARD

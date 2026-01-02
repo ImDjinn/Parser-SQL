@@ -80,7 +80,7 @@ Dialectes supportés: standard, presto, athena, trino, postgresql, mysql, bigque
     parser.add_argument(
         "-d", "--dialect",
         type=str,
-        choices=['standard', 'presto', 'athena', 'trino', 'postgresql', 'mysql', 'bigquery', 'snowflake', 'spark'],
+        choices=['standard', 'presto', 'athena', 'trino', 'postgresql', 'mysql', 'bigquery', 'snowflake', 'spark', 'tsql'],
         default=None,
         help="Dialecte SQL à utiliser (auto-détection si non spécifié)"
     )
@@ -144,7 +144,7 @@ Dialectes supportés: standard, presto, athena, trino, postgresql, mysql, bigque
         "--transpile", "-t",
         type=str,
         metavar="TARGET",
-        choices=['standard', 'presto', 'athena', 'trino', 'postgresql', 'mysql', 'bigquery', 'snowflake', 'spark'],
+        choices=['standard', 'presto', 'athena', 'trino', 'postgresql', 'mysql', 'bigquery', 'snowflake', 'spark', 'tsql'],
         help="Transpiler vers un autre dialecte (ex: --dialect presto --transpile postgresql)"
     )
     
@@ -217,6 +217,7 @@ Dialectes supportés: standard, presto, athena, trino, postgresql, mysql, bigque
             'bigquery': SQLDialect.BIGQUERY,
             'snowflake': SQLDialect.SNOWFLAKE,
             'spark': SQLDialect.SPARK,
+            'tsql': SQLDialect.TSQL,
         }
         dialect = dialect_map.get(args.dialect)
     
@@ -263,6 +264,7 @@ Dialectes supportés: standard, presto, athena, trino, postgresql, mysql, bigque
             'bigquery': SQLDialect.BIGQUERY,
             'snowflake': SQLDialect.SNOWFLAKE,
             'spark': SQLDialect.SPARK,
+            'tsql': SQLDialect.TSQL,
         }
         target = target_map[args.transpile]
         
