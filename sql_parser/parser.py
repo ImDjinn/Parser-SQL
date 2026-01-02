@@ -1119,7 +1119,7 @@ class SQLParser:
                 # DATE sans littéral - traiter comme identifiant
                 return Identifier(name=type_name)
         
-        # Parenthèses ou sous-requête
+        # Parenthèses ou sous-requête ou lambda multi-paramètres
         if self._consume_if(TokenType.LPAREN):
             if self._check(TokenType.SELECT):
                 self.has_subquery = True
@@ -1127,6 +1127,11 @@ class SQLParser:
                 self._expect(TokenType.RPAREN)
                 return SubqueryExpression(query=subquery)
             else:
+                # Check for multi-parameter lambda: (x, y) -> expr
+                # Look ahead to see if this could be a lambda parameter list
+                if self._is_lambda_params():
+                    return self._parse_multi_param_lambda()
+                
                 expr = self._parse_expression()
                 self._expect(TokenType.RPAREN)
                 return expr
@@ -1606,6 +1611,62 @@ class SQLParser:
             then_expr=then_expr,
             else_expr=else_expr
         )
+    
+    def _is_lambda_params(self) -> bool:
+        """Check if current position looks like lambda parameters: x, y) ->"""
+        # Save position for lookahead
+        save_pos = self.pos
+        
+        try:
+            # Must start with identifier
+            if not self._check(TokenType.IDENTIFIER):
+                return False
+            
+            # Scan forward to find ) followed by ->
+            depth = 1
+            while self.pos < len(self.tokens) - 1:
+                token = self._current()
+                
+                if token.type == TokenType.LPAREN:
+                    depth += 1
+                elif token.type == TokenType.RPAREN:
+                    depth -= 1
+                    if depth == 0:
+                        # Found matching ), check for ->
+                        self._advance()
+                        is_lambda = self._check(TokenType.ARROW)
+                        return is_lambda
+                elif token.type not in (TokenType.IDENTIFIER, TokenType.COMMA):
+                    # Lambda params should only have identifiers and commas
+                    return False
+                
+                self._advance()
+            
+            return False
+        finally:
+            self.pos = save_pos
+    
+    def _parse_multi_param_lambda(self) -> LambdaExpression:
+        """Parse a multi-parameter lambda: (x, y) -> x + y"""
+        parameters = []
+        
+        # Parse parameter list
+        while True:
+            if not self._check(TokenType.IDENTIFIER):
+                raise SQLParserError("Expected parameter name in lambda", self._current())
+            
+            param = self._advance().value
+            parameters.append(param)
+            
+            if not self._consume_if(TokenType.COMMA):
+                break
+        
+        self._expect(TokenType.RPAREN)
+        self._expect(TokenType.ARROW)
+        
+        body = self._parse_expression()
+        
+        return LambdaExpression(parameters=parameters, body=body)
     
     def _parse_lambda_expression(self, first_param: str) -> LambdaExpression:
         """Parse une lambda: x -> x + 1 (Presto/Athena)."""

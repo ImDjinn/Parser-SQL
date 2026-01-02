@@ -675,6 +675,19 @@ class FromClause(ASTNode):
     """Clause FROM complète."""
     tables: List[Union[TableRef, SubqueryRef, JoinClause]]
     
+    @property
+    def joins(self) -> List[JoinClause]:
+        """Retourne la liste de tous les JOINs dans la clause FROM."""
+        return [t for t in self.tables if isinstance(t, JoinClause)]
+    
+    @property
+    def primary_table(self) -> Optional[Union[TableRef, SubqueryRef]]:
+        """Retourne la table principale (première table non-JOIN)."""
+        for t in self.tables:
+            if isinstance(t, (TableRef, SubqueryRef)):
+                return t
+        return None
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
             "node_type": "FromClause",
