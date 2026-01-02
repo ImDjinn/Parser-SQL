@@ -1,6 +1,6 @@
 # SQL Parser
 
-A high-performance SQL parser written in Python that converts SQL code into structured JSON/AST. Supports multiple SQL dialects with cross-dialect transpilation and dbt model generation.
+A high-performance SQL parser written in Python that converts SQL code into structured JSON/AST. Supports multiple SQL dialects with cross-dialect transpilation, dbt model generation, and SQL formatting.
 
 ## Features
 
@@ -8,11 +8,16 @@ A high-performance SQL parser written in Python that converts SQL code into stru
   - Standard SQL, Presto, Athena, Trino, PostgreSQL, MySQL, BigQuery, Snowflake, Spark, T-SQL
 
 - **Complete SQL Coverage**:
-  - DML: SELECT, INSERT, UPDATE, DELETE, MERGE
+  - DML: SELECT, INSERT, UPDATE, DELETE, MERGE, VALUES
   - DDL: CREATE TABLE/VIEW, DROP, ALTER, TRUNCATE
+  - Admin: EXPLAIN, VACUUM, GRANT, REVOKE
   - Expressions: CASE, subqueries, CTEs, window functions
+  - Advanced: GROUPING SETS, CUBE, ROLLUP, EXTRACT, JSON functions
   - Presto/Athena: UNNEST, ARRAY[], MAP(), lambdas, TRY_CAST
-  - T-SQL: TOP, NOLOCK hints, bracket identifiers `[column]`
+  - T-SQL: TOP, NOLOCK hints, bracket identifiers `[column]`, CROSS/OUTER APPLY
+  - Data Lakes: catalog.schema.table (3-level naming for Databricks/Unity Catalog)
+
+- **SQL Formatter**: Format and indent SQL code with customizable styles
 
 - **Transpilation**: Convert SQL between dialects with automatic function mapping
 
@@ -51,11 +56,38 @@ result = parser.parse("SELECT id, name FROM users WHERE status = 'active'")
 # Access parse results
 print(result.tables_referenced)  # ['users']
 print(result.columns_referenced) # ['id', 'name', 'status']
-print(result.statement_type)     # 'SELECT'
 
 # Get the AST
 ast = result.statement
 print(ast.to_dict())  # Full AST as dictionary
+```
+
+### SQL Formatting
+
+```python
+from sql_parser import format_sql, minify_sql, validate_sql
+
+# Format ugly SQL
+ugly_sql = "SELECT a,b,c FROM t WHERE x>1 AND y<2 ORDER BY a"
+formatted = format_sql(ugly_sql)
+print(formatted)
+# SELECT
+#     a,
+#     b,
+#     c
+# FROM t
+# WHERE ((x > 1) AND (y < 2))
+# ORDER BY a
+
+# Minify SQL
+minified = minify_sql(formatted)
+print(minified)
+# SELECT a, b, c FROM t WHERE ((x > 1) AND (y < 2)) ORDER BY a
+
+# Validate SQL syntax
+result = validate_sql("SELECT * FROM users")
+print(result['valid'])  # True
+print(result['info'])   # {'statement_type': 'SelectStatement', 'tables': ['users'], ...}
 ```
 
 ### Export to JSON
@@ -79,7 +111,7 @@ Output:
   "has_subquery": false,
   "statement": {
     "node_type": "SelectStatement",
-    "columns": [{"node_type": "Star"}],
+    "select": [{"node_type": "Star"}],
     "from_clause": {...},
     "where_clause": {...}
   }
@@ -91,9 +123,16 @@ Output:
 ```python
 from sql_parser import SQLParser, SQLDialect
 
-# Parse T-SQL with bracket identifiers
+# Parse T-SQL with TOP and bracket identifiers
 parser = SQLParser(dialect=SQLDialect.TSQL)
 result = parser.parse("SELECT TOP 10 [First Name] FROM [Users Table] WITH (NOLOCK)")
+
+# Parse with CROSS APPLY (T-SQL)
+result = parser.parse("""
+    SELECT u.name, o.total
+    FROM users u
+    CROSS APPLY (SELECT TOP 1 * FROM orders WHERE user_id = u.id) o
+""")
 
 # Parse Presto/Athena with lambdas and arrays
 parser = SQLParser(dialect=SQLDialect.PRESTO)
@@ -103,6 +142,9 @@ result = parser.parse("""
     FROM orders
     CROSS JOIN UNNEST(line_items) AS t(item)
 """)
+
+# Parse Databricks/Unity Catalog with 3-level names
+result = parser.parse("SELECT * FROM hive_metastore.bronze.raw_events")
 ```
 
 ## SQL Generation
@@ -230,6 +272,27 @@ FROM {{ ref('source') }} s
 {% endif %}
 ```
 
+## Admin Statements
+
+Parse database administration statements:
+
+```python
+from sql_parser import SQLParser
+
+parser = SQLParser()
+
+# EXPLAIN
+result = parser.parse("EXPLAIN ANALYZE SELECT * FROM users")
+print(result.statement.analyze)  # True
+
+# VACUUM (PostgreSQL)
+result = parser.parse("VACUUM FULL ANALYZE users (name, email)")
+
+# GRANT/REVOKE
+result = parser.parse("GRANT SELECT, INSERT ON TABLE orders TO admin WITH GRANT OPTION")
+result = parser.parse("REVOKE ALL PRIVILEGES ON DATABASE mydb FROM old_user CASCADE")
+```
+
 ## Jinja Template Support
 
 Parse SQL containing dbt/Jinja templates:
@@ -244,8 +307,6 @@ WHERE created_at > {{ var('start_date') }}
 """
 
 result = SQLParser().parse(sql)
-print(result.jinja_variables)  # ['table_name']
-print(result.jinja_refs)       # ['users']
 ```
 
 ## API Reference
@@ -267,18 +328,33 @@ class SQLParser:
 @dataclass
 class ParseResult:
     statement: Statement          # AST root node
-    statement_type: str           # 'SELECT', 'INSERT', etc.
-    tables_referenced: Set[str]   # Tables used in query
-    columns_referenced: Set[str]  # Columns referenced
-    functions_used: Set[str]      # Functions called
+    tables_referenced: List[str]  # Tables used in query
+    columns_referenced: List[str] # Columns referenced
+    functions_used: List[str]     # Functions called
     has_aggregation: bool         # Contains aggregate functions
     has_subquery: bool            # Contains subqueries
-    has_cte: bool                 # Contains WITH clause
-    cte_names: List[str]          # CTE names defined
-    jinja_variables: List[str]    # Jinja variables found
-    jinja_refs: List[str]         # dbt ref() calls found
-    dialect: SQLDialect           # Detected/specified dialect
-    warnings: List[str]           # Parse warnings
+    has_join: bool                # Contains JOIN clauses
+```
+
+### SQL Formatter
+
+```python
+from sql_parser import format_sql, minify_sql, validate_sql, FormatStyle
+
+# Format with style
+formatted = format_sql(sql, style=FormatStyle.STANDARD)
+formatted = format_sql(sql, style=FormatStyle.COMPACT)
+formatted = format_sql(sql, style=FormatStyle.EXPANDED)
+
+# Custom options
+formatted = format_sql(sql, indent_size=2, uppercase_keywords=True)
+
+# Minify
+minified = minify_sql(sql)
+
+# Validate
+result = validate_sql(sql)
+# Returns: {'valid': bool, 'error': str|None, 'formatted': str, 'info': dict}
 ```
 
 ### Transpiler
@@ -326,12 +402,46 @@ class ConversionResult:
 | Presto | `SQLDialect.PRESTO` | UNNEST, lambdas, TRY_CAST |
 | Athena | `SQLDialect.ATHENA` | Same as Presto |
 | Trino | `SQLDialect.TRINO` | Same as Presto |
-| PostgreSQL | `SQLDialect.POSTGRESQL` | `::` casts |
+| PostgreSQL | `SQLDialect.POSTGRESQL` | `::` casts, VACUUM, EXPLAIN ANALYZE |
 | MySQL | `SQLDialect.MYSQL` | Backtick identifiers |
 | BigQuery | `SQLDialect.BIGQUERY` | SAFE_CAST, INT64 |
 | Snowflake | `SQLDialect.SNOWFLAKE` | FLATTEN |
 | Spark SQL | `SQLDialect.SPARK` | Similar to Presto |
-| T-SQL | `SQLDialect.TSQL` | TOP, NOLOCK, `[identifiers]` |
+| T-SQL | `SQLDialect.TSQL` | TOP, NOLOCK, `[identifiers]`, CROSS/OUTER APPLY |
+
+## Supported SQL Features
+
+### Statements
+- SELECT (with all clauses)
+- INSERT, UPDATE, DELETE
+- MERGE (with WHEN MATCHED/NOT MATCHED)
+- VALUES (standalone)
+- CREATE TABLE/VIEW, DROP, ALTER, TRUNCATE
+- EXPLAIN, VACUUM
+- GRANT, REVOKE
+
+### Clauses & Expressions
+- FROM with JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL)
+- CROSS APPLY, OUTER APPLY (T-SQL)
+- WHERE, GROUP BY, HAVING, ORDER BY
+- LIMIT, OFFSET, TOP (T-SQL)
+- DISTINCT, DISTINCT ON (PostgreSQL)
+- CTEs (WITH clause, recursive)
+- UNION, INTERSECT, EXCEPT
+- Window functions (OVER, PARTITION BY, frame specs)
+- CASE expressions
+- Subqueries (scalar, IN, EXISTS)
+- GROUPING SETS, CUBE, ROLLUP
+- EXTRACT(field FROM expr)
+- JSON functions (JSON_OBJECT, JSON_ARRAY)
+- ALL/ANY/SOME comparisons
+
+### Identifiers
+- Regular: `table_name`
+- Quoted: `"table name"`
+- Backticks: `` `table` `` (MySQL)
+- Brackets: `[table]` (T-SQL)
+- 3-level: `catalog.schema.table` (Databricks)
 
 ## Testing
 
@@ -346,7 +456,7 @@ pytest tests/test_parser.py -v
 pytest tests/ --cov=sql_parser --cov-report=html
 ```
 
-Current test coverage: **265 tests passing**
+Current test coverage: **589 tests passing**
 
 ## Project Structure
 
@@ -358,12 +468,14 @@ sql_parser/
 ├── parser.py            # SQL parser
 ├── json_exporter.py     # JSON export
 ├── sql_generator.py     # SQL generation from AST
+├── formatter.py         # SQL formatting utilities
 ├── transpiler.py        # Cross-dialect transpilation
 ├── dbt_converter.py     # dbt model generation
 └── dialects.py          # Dialect definitions
 
 tests/
 ├── test_parser.py       # Parser unit tests
+├── test_new_features.py # New features tests (62 tests)
 ├── test_dbt_converter.py # dbt converter tests
 └── test_regression.py   # Comprehensive regression tests
 ```
