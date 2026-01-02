@@ -10,7 +10,7 @@ from .tokenizer import SQLTokenizer, Token, TokenType
 from .dialects import SQLDialect, get_dialect_features, detect_dialect
 from .ast_nodes import (
     Expression, Literal, Identifier, ColumnRef, Star, Parameter,
-    BinaryOp, UnaryOp, FunctionCall, CaseExpression,
+    BinaryOp, UnaryOp, FunctionCall, CaseExpression, NamedArgument,
     InExpression, BetweenExpression, LikeExpression, IsNullExpression,
     ExistsExpression, SubqueryExpression, CastExpression,
     SelectItem, TableRef, SubqueryRef, JoinClause, FromClause,
@@ -1298,6 +1298,9 @@ class SQLParser:
             
             distinct = self._consume_if(TokenType.DISTINCT)
             
+            # STRUCT et ROW supportent les arguments nommés (expr AS name)
+            supports_named_args = func_name in ('STRUCT', 'ROW')
+            
             args = []
             if not self._check(TokenType.RPAREN):
                 if self._check(TokenType.STAR):
@@ -1306,6 +1309,10 @@ class SQLParser:
                 else:
                     while True:
                         arg = self._parse_expression()
+                        # Check for named argument (expr AS name)
+                        if supports_named_args and self._consume_if(TokenType.AS):
+                            arg_name_token = self._expect(TokenType.IDENTIFIER, "Expected field name after AS")
+                            arg = NamedArgument(expression=arg, name=arg_name_token.value)
                         args.append(arg)
                         if not self._consume_if(TokenType.COMMA):
                             break

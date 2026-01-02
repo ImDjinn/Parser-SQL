@@ -9,7 +9,7 @@ Supporte plusieurs dialectes: Standard, Presto/Athena, etc.
 from typing import List, Optional, Union
 from .ast_nodes import (
     ASTNode, Expression, Literal, Identifier, ColumnRef, Star, Parameter,
-    BinaryOp, UnaryOp, FunctionCall, CaseExpression,
+    BinaryOp, UnaryOp, FunctionCall, CaseExpression, NamedArgument,
     InExpression, BetweenExpression, LikeExpression, IsNullExpression,
     ExistsExpression, SubqueryExpression, CastExpression,
     SelectItem, TableRef, SubqueryRef, JoinClause, FromClause,
@@ -168,6 +168,11 @@ class SQLGenerator:
         operand = self._generate_node(node.operand)
         op = self._kw(node.operator) if node.operator == 'NOT' else node.operator
         return f'{op} {operand}'
+    
+    def _gen_NamedArgument(self, node: NamedArgument) -> str:
+        """Génère un argument nommé (expr AS name)."""
+        expr = self._generate_node(node.expression)
+        return f'{expr} {self._kw("AS")} {node.name}'
     
     def _gen_FunctionCall(self, node: FunctionCall) -> str:
         """Génère un appel de fonction."""

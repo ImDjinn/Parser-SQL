@@ -623,7 +623,9 @@ class TestDialectFeatures:
         assert "TRY" in sql
     
     def test_bigquery_struct(self):
-        result = SQLParser().parse("SELECT STRUCT(1, 2)")
+        result = SQLParser().parse("SELECT STRUCT(1 AS a, 2 AS b)")
         gen = SQLGenerator(dialect=SQLDialect.BIGQUERY)
         sql = gen.generate(result.statement)
         assert "STRUCT" in sql
+        assert "AS a" in sql
+        assert "AS b" in sql

@@ -227,6 +227,20 @@ class UnaryOp(Expression):
 
 
 @dataclass
+class NamedArgument(Expression):
+    """Argument nommé pour STRUCT/ROW (ex: 1 AS field_name)."""
+    expression: Expression
+    name: str
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "NamedArgument",
+            "expression": self.expression.to_dict(),
+            "name": self.name
+        }
+
+
+@dataclass
 class FunctionCall(Expression):
     """Appel de fonction (ex: COUNT(*), UPPER(name))."""
     name: str

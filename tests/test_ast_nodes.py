@@ -87,8 +87,12 @@ class TestColumnRefParsing:
         assert result.statement is not None
     
     def test_fully_qualified_column(self):
-        result = SQLParser().parse("SELECT t.column_name FROM my_schema.my_table t")
+        result = SQLParser().parse("SELECT schema_name.table_name.column_name FROM schema_name.table_name")
         assert result.statement is not None
+        expr = result.statement.select_items[0].expression
+        assert expr.column == "column_name"
+        assert expr.table == "table_name"
+        assert expr.schema == "schema_name"
 
 
 # ============================================================
