@@ -116,6 +116,24 @@ Dialectes supportés: standard, presto, athena, trino, postgresql, mysql, bigque
         help="Afficher seulement le statement (sans wrapper)"
     )
     
+    parser.add_argument(
+        "--generate", "-g",
+        action="store_true",
+        help="Générer du SQL à partir de l'AST (réversibilité)"
+    )
+    
+    parser.add_argument(
+        "--inline",
+        action="store_true",
+        help="Générer le SQL sur une seule ligne (avec --generate)"
+    )
+    
+    parser.add_argument(
+        "--lowercase",
+        action="store_true",
+        help="Mots-clés en minuscules (avec --generate)"
+    )
+    
     args = parser.parse_args()
     
     # Récupération du SQL
@@ -195,6 +213,26 @@ Dialectes supportés: standard, presto, athena, trino, postgresql, mysql, bigque
     except Exception as e:
         print(f"Erreur de parsing: {e}", file=sys.stderr)
         sys.exit(1)
+    
+    # Mode génération SQL (réversibilité)
+    if args.generate:
+        from .sql_generator import SQLGenerator
+        
+        generator = SQLGenerator(
+            dialect=dialect or SQLDialect.STANDARD,
+            indent=args.indent,
+            uppercase_keywords=not args.lowercase,
+            inline=args.inline
+        )
+        
+        generated_sql = generator.generate(result)
+        
+        if args.output:
+            Path(args.output).write_text(generated_sql, encoding='utf-8')
+            print(f"SQL généré sauvegardé dans '{args.output}'")
+        else:
+            print(generated_sql)
+        return
     
     # Export JSON
     if args.statement_only:
