@@ -11,10 +11,11 @@ from .ast_nodes import (
     ASTNode, Expression, Literal, Identifier, ColumnRef, Star, Parameter,
     BinaryOp, UnaryOp, FunctionCall, CaseExpression, NamedArgument,
     InExpression, BetweenExpression, LikeExpression, IsNullExpression,
-    ExistsExpression, SubqueryExpression, CastExpression,
+    ExistsExpression, SubqueryExpression, CastExpression, ExtractExpression,
     SelectItem, TableRef, SubqueryRef, JoinClause, FromClause,
     JoinType, OrderDirection, SetOperationType, OrderByItem,
     CTEDefinition, SelectStatement, ParseInfo, ParseResult,
+    GroupingSets, Cube, Rollup,
     # Presto/Athena specific
     ArrayExpression, MapExpression, RowExpression, ArraySubscript,
     LambdaExpression, IntervalExpression, AtTimeZone, TryExpression,
@@ -145,10 +146,23 @@ class SQLGenerator:
         return '.'.join(parts)
     
     def _gen_Star(self, node: Star) -> str:
-        """Génère un *."""
-        if node.table:
-            return f'{node.table}.*'
-        return '*'
+        """Génère un * avec support EXCEPT/REPLACE."""
+        result = f'{node.table}.*' if node.table else '*'
+        
+        # EXCEPT(col1, col2)
+        if node.except_columns:
+            cols = ', '.join(node.except_columns)
+            result += f' {self._kw("EXCEPT")}({cols})'
+        
+        # REPLACE(expr AS alias)
+        if node.replace_columns:
+            replacements = ', '.join(
+                f'{self._generate_node(expr)} {self._kw("AS")} {alias}'
+                for expr, alias in node.replace_columns
+            )
+            result += f' {self._kw("REPLACE")}({replacements})'
+        
+        return result
     
     def _gen_Parameter(self, node: Parameter) -> str:
         """Génère un paramètre."""
@@ -173,6 +187,12 @@ class SQLGenerator:
         """Génère un argument nommé (expr AS name)."""
         expr = self._generate_node(node.expression)
         return f'{expr} {self._kw("AS")} {node.name}'
+    
+    def _gen_KeyValuePair(self, node) -> str:
+        """Génère une paire clé:valeur (pour JSON_OBJECT, etc.)."""
+        key = self._generate_node(node.key)
+        value = self._generate_node(node.value)
+        return f'{key}: {value}'
     
     def _gen_FunctionCall(self, node: FunctionCall) -> str:
         """Génère un appel de fonction."""
@@ -203,6 +223,10 @@ class SQLGenerator:
         """Génère une fonction de fenêtre avec OVER."""
         # Générer l'appel de fonction de base
         func_str = self._gen_FunctionCall(node.function)
+        
+        # If using a named window reference
+        if node.window_name:
+            return f"{func_str} {self._kw('OVER')} {node.window_name}"
         
         # Construire la clause OVER
         over_parts = []
@@ -241,6 +265,35 @@ class SQLGenerator:
         else:
             cast_kw = self._kw('CAST')
         return f"{cast_kw}({expr} {self._kw('AS')} {node.target_type})"
+    
+    def _gen_ExtractExpression(self, node: ExtractExpression) -> str:
+        """Génère une expression EXTRACT."""
+        expr = self._generate_node(node.expression)
+        field = node.field.upper() if self.uppercase_keywords else node.field.lower()
+        return f"{self._kw('EXTRACT')}({field} {self._kw('FROM')} {expr})"
+    
+    def _gen_WindowDefinition(self, node) -> str:
+        """Génère une définition de fenêtre nommée."""
+        over_parts = []
+        
+        if node.partition_by:
+            partition_exprs = ', '.join(self._generate_node(e) for e in node.partition_by)
+            over_parts.append(f"{self._kw('PARTITION BY')} {partition_exprs}")
+        
+        if node.order_by:
+            order_exprs = ', '.join(self._gen_OrderByItem(o) for o in node.order_by)
+            over_parts.append(f"{self._kw('ORDER BY')} {order_exprs}")
+        
+        if node.frame_type:
+            frame_str = node.frame_type.upper() if self.uppercase_keywords else node.frame_type.lower()
+            if node.frame_end:
+                frame_str += f" {self._kw('BETWEEN')} {node.frame_start} {self._kw('AND')} {node.frame_end}"
+            elif node.frame_start:
+                frame_str += f" {node.frame_start}"
+            over_parts.append(frame_str)
+        
+        over_clause = ' '.join(over_parts)
+        return f"{node.name} {self._kw('AS')} ({over_clause})"
     
     def _gen_CaseExpression(self, node: CaseExpression) -> str:
         """Génère une expression CASE."""
@@ -453,6 +506,29 @@ class SQLGenerator:
         
         return self._newline().join(parts) if not self.inline else ' '.join(parts)
     
+    def _gen_GroupingSets(self, node: GroupingSets) -> str:
+        """Génère GROUPING SETS ((a), (b), ())."""
+        sets_strs = []
+        for s in node.sets:
+            if len(s) == 0:
+                sets_strs.append('()')
+            elif len(s) == 1:
+                sets_strs.append(f'({self._generate_node(s[0])})')
+            else:
+                exprs = ', '.join(self._generate_node(e) for e in s)
+                sets_strs.append(f'({exprs})')
+        return f"{self._kw('GROUPING SETS')} ({', '.join(sets_strs)})"
+    
+    def _gen_Cube(self, node: Cube) -> str:
+        """Génère CUBE(a, b)."""
+        exprs = ', '.join(self._generate_node(e) for e in node.expressions)
+        return f"{self._kw('CUBE')}({exprs})"
+    
+    def _gen_Rollup(self, node: Rollup) -> str:
+        """Génère ROLLUP(a, b)."""
+        exprs = ', '.join(self._generate_node(e) for e in node.expressions)
+        return f"{self._kw('ROLLUP')}({exprs})"
+    
     def _gen_OrderByItem(self, node: OrderByItem) -> str:
         """Génère un élément ORDER BY."""
         expr = self._generate_node(node.expression)
@@ -550,6 +626,11 @@ class SQLGenerator:
         if node.having_clause:
             having_expr = self._generate_node(node.having_clause)
             parts.append(f'{self._kw("HAVING")} {having_expr}')
+        
+        # WINDOW clause
+        if node.window_clause:
+            window_defs = ', '.join(self._gen_WindowDefinition(w) for w in node.window_clause)
+            parts.append(f'{self._kw("WINDOW")} {window_defs}')
         
         # ORDER BY
         if node.order_by:

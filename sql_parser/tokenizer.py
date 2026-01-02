@@ -129,9 +129,12 @@ class TokenType(Enum):
     PARTITION = auto()
     ROWS = auto()
     RANGE = auto()
+    GROUPS = auto()  # Window frame type
     NULLS = auto()
     FIRST = auto()
     LAST = auto()
+    WINDOW = auto()  # WINDOW clause
+    EXCLUDE = auto()  # EXCLUDE in window frames
     
     # Presto/Athena spécifiques
     UNNEST = auto()
@@ -328,9 +331,12 @@ class SQLTokenizer:
         'partition': TokenType.PARTITION,
         'rows': TokenType.ROWS,
         'range': TokenType.RANGE,
+        'groups': TokenType.GROUPS,
         'nulls': TokenType.NULLS,
         'first': TokenType.FIRST,
         'last': TokenType.LAST,
+        'window': TokenType.WINDOW,
+        'exclude': TokenType.EXCLUDE,
         # Presto/Athena
         'unnest': TokenType.UNNEST,
         'ordinality': TokenType.ORDINALITY,

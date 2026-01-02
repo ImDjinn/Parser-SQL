@@ -171,13 +171,19 @@ class ColumnRef(Expression):
 
 @dataclass
 class Star(Expression):
-    """Représente * ou table.* dans SELECT."""
+    """Représente * ou table.* dans SELECT, avec support EXCEPT/REPLACE (BigQuery)."""
     table: Optional[str] = None
+    except_columns: Optional[List[str]] = None  # EXCEPT(col1, col2)
+    replace_columns: Optional[List[tuple]] = None  # REPLACE(expr AS col)
     
     def to_dict(self) -> Dict[str, Any]:
         result = {"node_type": "Star"}
         if self.table:
             result["table"] = self.table
+        if self.except_columns:
+            result["except"] = self.except_columns
+        if self.replace_columns:
+            result["replace"] = [{"expression": e.to_dict(), "alias": a} for e, a in self.replace_columns]
         return result
 
 
@@ -237,6 +243,20 @@ class NamedArgument(Expression):
             "node_type": "NamedArgument",
             "expression": self.expression.to_dict(),
             "name": self.name
+        }
+
+
+@dataclass
+class KeyValuePair(Expression):
+    """Paire clé:valeur pour JSON_OBJECT, etc."""
+    key: Expression
+    value: Expression
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "KeyValuePair",
+            "key": self.key.to_dict(),
+            "value": self.value.to_dict()
         }
 
 
@@ -395,6 +415,20 @@ class CastExpression(Expression):
         return result
 
 
+@dataclass
+class ExtractExpression(Expression):
+    """Expression EXTRACT (ex: EXTRACT(YEAR FROM date_col))."""
+    field: str  # YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, etc.
+    expression: Expression
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "ExtractExpression",
+            "field": self.field,
+            "expression": self.expression.to_dict()
+        }
+
+
 # ============== Expressions Presto/Athena spécifiques ==============
 
 @dataclass
@@ -541,9 +575,10 @@ class WindowFunction(Expression):
     function: FunctionCall
     partition_by: Optional[List[Expression]] = None
     order_by: Optional[List['OrderByItem']] = None
-    frame_type: Optional[str] = None  # ROWS, RANGE
+    frame_type: Optional[str] = None  # ROWS, RANGE, GROUPS
     frame_start: Optional[str] = None  # UNBOUNDED PRECEDING, CURRENT ROW, etc.
     frame_end: Optional[str] = None
+    window_name: Optional[str] = None  # Reference to named window (OVER w)
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -709,6 +744,56 @@ class FromClause(ASTNode):
         }
 
 
+# ============== Clause GROUP BY avancée ==============
+
+@dataclass
+class GroupingElement(ASTNode):
+    """Element de base pour GROUP BY."""
+    expressions: List[Expression] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "GroupingElement",
+            "expressions": [e.to_dict() for e in self.expressions]
+        }
+
+
+@dataclass
+class GroupingSets(ASTNode):
+    """GROUPING SETS ((a), (b), (a, b))."""
+    sets: List[List[Expression]] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "GroupingSets",
+            "sets": [[e.to_dict() for e in s] for s in self.sets]
+        }
+
+
+@dataclass
+class Cube(ASTNode):
+    """CUBE(a, b) - toutes les combinaisons possibles."""
+    expressions: List[Expression] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "Cube",
+            "expressions": [e.to_dict() for e in self.expressions]
+        }
+
+
+@dataclass
+class Rollup(ASTNode):
+    """ROLLUP(a, b) - hiérarchie des agrégations."""
+    expressions: List[Expression] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "Rollup",
+            "expressions": [e.to_dict() for e in self.expressions]
+        }
+
+
 # ============== Clause ORDER BY ==============
 
 @dataclass
@@ -755,6 +840,34 @@ class CTEDefinition(ASTNode):
 # ============== Statement principal: SELECT ==============
 
 @dataclass
+class WindowDefinition(ASTNode):
+    """Définition d'une fenêtre nommée (WINDOW w AS (...))."""
+    name: str
+    partition_by: Optional[List[Expression]] = None
+    order_by: Optional[List['OrderByItem']] = None
+    frame_type: Optional[str] = None  # ROWS, RANGE, GROUPS
+    frame_start: Optional[str] = None
+    frame_end: Optional[str] = None
+    frame_exclusion: Optional[str] = None  # EXCLUDE CURRENT ROW, etc.
+    
+    def to_dict(self) -> Dict[str, Any]:
+        result = {"node_type": "WindowDefinition", "name": self.name}
+        if self.partition_by:
+            result["partition_by"] = [e.to_dict() for e in self.partition_by]
+        if self.order_by:
+            result["order_by"] = [o.to_dict() for o in self.order_by]
+        if self.frame_type:
+            result["frame_type"] = self.frame_type
+        if self.frame_start:
+            result["frame_start"] = self.frame_start
+        if self.frame_end:
+            result["frame_end"] = self.frame_end
+        if self.frame_exclusion:
+            result["frame_exclusion"] = self.frame_exclusion
+        return result
+
+
+@dataclass
 class SelectStatement(ASTNode):
     """Statement SELECT complet."""
     select_items: List[SelectItem] = field(default_factory=list)
@@ -768,6 +881,7 @@ class SelectStatement(ASTNode):
     distinct: bool = False
     distinct_on: Optional[List[Expression]] = None  # PostgreSQL DISTINCT ON (col1, col2)
     ctes: Optional[List[CTEDefinition]] = None
+    window_clause: Optional[List[WindowDefinition]] = None  # WINDOW w AS (...)
     metadata: Optional[Dict[str, Any]] = None  # Jinja config, etc.
     
     # Pour UNION, INTERSECT, EXCEPT

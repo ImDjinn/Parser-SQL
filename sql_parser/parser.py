@@ -10,12 +10,13 @@ from .tokenizer import SQLTokenizer, Token, TokenType
 from .dialects import SQLDialect, get_dialect_features, detect_dialect
 from .ast_nodes import (
     Expression, Literal, Identifier, ColumnRef, Star, Parameter,
-    BinaryOp, UnaryOp, FunctionCall, CaseExpression, NamedArgument,
+    BinaryOp, UnaryOp, FunctionCall, CaseExpression, NamedArgument, KeyValuePair,
     InExpression, BetweenExpression, LikeExpression, IsNullExpression,
-    ExistsExpression, SubqueryExpression, CastExpression,
+    ExistsExpression, SubqueryExpression, CastExpression, ExtractExpression,
     SelectItem, TableRef, SubqueryRef, JoinClause, FromClause,
     JoinType, OrderDirection, SetOperationType, OrderByItem,
     CTEDefinition, SelectStatement, ParseInfo, ParseResult,
+    GroupingSets, Cube, Rollup, WindowDefinition,
     # Presto/Athena specific
     ArrayExpression, MapExpression, RowExpression, ArraySubscript,
     LambdaExpression, IntervalExpression, AtTimeZone, TryExpression,
@@ -472,6 +473,11 @@ class SQLParser:
             self._advance()
             having_clause = self._parse_expression()
         
+        # WINDOW clause (WINDOW w AS (...))
+        window_clause = None
+        if self._check(TokenType.WINDOW):
+            window_clause = self._parse_window_clause()
+        
         # ORDER BY clause
         order_by = None
         if self._check(TokenType.ORDER):
@@ -508,7 +514,8 @@ class SQLParser:
             limit=limit,
             offset=offset,
             distinct=distinct,
-            distinct_on=distinct_on
+            distinct_on=distinct_on,
+            window_clause=window_clause
         )
         
         # UNION, INTERSECT, EXCEPT
@@ -556,18 +563,20 @@ class SQLParser:
     
     def _parse_select_item(self) -> SelectItem:
         """Parse un élément SELECT (expression AS alias)."""
-        # Cas spécial: *
+        # Cas spécial: * ou * EXCEPT(...) ou * REPLACE(...)
         if self._check(TokenType.STAR):
             self._advance()
-            return SelectItem(expression=Star())
+            star = self._parse_star_modifiers(Star())
+            return SelectItem(expression=star)
         
-        # Cas spécial: table.*
+        # Cas spécial: table.* ou table.* EXCEPT(...)
         if self._check(TokenType.IDENTIFIER) and self._peek().type == TokenType.DOT:
             if self._peek(2).type == TokenType.STAR:
                 table_token = self._advance()
                 self._advance()  # .
                 self._advance()  # *
-                return SelectItem(expression=Star(table=table_token.value))
+                star = self._parse_star_modifiers(Star(table=table_token.value))
+                return SelectItem(expression=star)
         
         # Expression normale
         expr = self._parse_expression()
@@ -583,6 +592,36 @@ class SQLParser:
             alias = alias_token.value
         
         return SelectItem(expression=expr, alias=alias)
+    
+    def _parse_star_modifiers(self, star: Star) -> Star:
+        """Parse les modificateurs EXCEPT/REPLACE après *."""
+        # EXCEPT(col1, col2)
+        if self._consume_if(TokenType.EXCEPT):
+            self._expect(TokenType.LPAREN)
+            except_cols = []
+            while True:
+                col_token = self._expect(TokenType.IDENTIFIER, "Expected column name")
+                except_cols.append(col_token.value)
+                if not self._consume_if(TokenType.COMMA):
+                    break
+            self._expect(TokenType.RPAREN)
+            star.except_columns = except_cols
+        
+        # REPLACE(expr AS alias, ...)
+        if self._consume_if(TokenType.REPLACE):
+            self._expect(TokenType.LPAREN)
+            replace_cols = []
+            while True:
+                expr = self._parse_expression()
+                self._expect(TokenType.AS, "Expected AS in REPLACE")
+                alias_token = self._expect(TokenType.IDENTIFIER, "Expected alias in REPLACE")
+                replace_cols.append((expr, alias_token.value))
+                if not self._consume_if(TokenType.COMMA):
+                    break
+            self._expect(TokenType.RPAREN)
+            star.replace_columns = replace_cols
+        
+        return star
     
     def _parse_from_clause(self) -> FromClause:
         """Parse la clause FROM."""
@@ -822,8 +861,20 @@ class SQLParser:
         
         # Détermine le type de JOIN
         if self._consume_if(TokenType.NATURAL):
-            self._consume_if(TokenType.INNER)
-            join_type = JoinType.NATURAL
+            # NATURAL [INNER|LEFT|RIGHT|FULL] JOIN
+            if self._consume_if(TokenType.LEFT):
+                self._consume_if(TokenType.OUTER)
+                join_type = JoinType.LEFT
+            elif self._consume_if(TokenType.RIGHT):
+                self._consume_if(TokenType.OUTER)
+                join_type = JoinType.RIGHT
+            elif self._consume_if(TokenType.FULL):
+                self._consume_if(TokenType.OUTER)
+                join_type = JoinType.FULL
+            else:
+                self._consume_if(TokenType.INNER)
+                join_type = JoinType.NATURAL
+            self._expect(TokenType.JOIN)
         elif self._consume_if(TokenType.CROSS):
             self._expect(TokenType.JOIN)
             join_type = JoinType.CROSS
@@ -870,20 +921,71 @@ class SQLParser:
             using_columns=using_columns
         )
     
-    def _parse_group_by(self) -> List[Expression]:
-        """Parse la clause GROUP BY."""
+    def _parse_group_by(self) -> List:
+        """Parse la clause GROUP BY avec support GROUPING SETS, CUBE, ROLLUP."""
         self._expect(TokenType.GROUP)
         self._expect(TokenType.BY)
         
-        expressions = []
+        elements = []
         while True:
-            expr = self._parse_expression()
-            expressions.append(expr)
+            element = self._parse_grouping_element()
+            elements.append(element)
             
             if not self._consume_if(TokenType.COMMA):
                 break
         
-        return expressions
+        return elements
+    
+    def _parse_grouping_element(self):
+        """Parse un élément de GROUP BY (expression, GROUPING SETS, CUBE, ROLLUP)."""
+        # GROUPING SETS
+        if self._consume_if(TokenType.GROUPING):
+            self._expect(TokenType.SETS)
+            self._expect(TokenType.LPAREN)
+            sets = []
+            while True:
+                if self._consume_if(TokenType.LPAREN):
+                    # (a, b)
+                    exprs = []
+                    if not self._check(TokenType.RPAREN):
+                        while True:
+                            exprs.append(self._parse_expression())
+                            if not self._consume_if(TokenType.COMMA):
+                                break
+                    self._expect(TokenType.RPAREN)
+                    sets.append(exprs)
+                else:
+                    # Expression simple
+                    sets.append([self._parse_expression()])
+                if not self._consume_if(TokenType.COMMA):
+                    break
+            self._expect(TokenType.RPAREN)
+            return GroupingSets(sets=sets)
+        
+        # CUBE
+        if self._consume_if(TokenType.CUBE):
+            self._expect(TokenType.LPAREN)
+            exprs = []
+            while True:
+                exprs.append(self._parse_expression())
+                if not self._consume_if(TokenType.COMMA):
+                    break
+            self._expect(TokenType.RPAREN)
+            return Cube(expressions=exprs)
+        
+        # ROLLUP
+        if self._consume_if(TokenType.ROLLUP):
+            self._expect(TokenType.LPAREN)
+            exprs = []
+            while True:
+                exprs.append(self._parse_expression())
+                if not self._consume_if(TokenType.COMMA):
+                    break
+            self._expect(TokenType.RPAREN)
+            return Rollup(expressions=exprs)
+        
+        # Expression simple
+        return self._parse_expression()
     
     def _parse_order_by(self) -> List[OrderByItem]:
         """Parse la clause ORDER BY."""
@@ -924,6 +1026,70 @@ class SQLParser:
             direction=direction,
             nulls_first=nulls_first
         )
+    
+    def _parse_window_clause(self) -> List[WindowDefinition]:
+        """Parse la clause WINDOW (WINDOW w AS (...), ...)."""
+        self._expect(TokenType.WINDOW)
+        
+        definitions = []
+        while True:
+            # Nom de la fenêtre
+            name_token = self._expect(TokenType.IDENTIFIER, "Expected window name")
+            self._expect(TokenType.AS)
+            self._expect(TokenType.LPAREN)
+            
+            # Contenu de la fenêtre (similaire à OVER)
+            partition_by = None
+            order_by = None
+            frame_type = None
+            frame_start = None
+            frame_end = None
+            
+            # PARTITION BY
+            if self._check(TokenType.PARTITION):
+                self._advance()
+                self._expect(TokenType.BY)
+                partition_by = []
+                while True:
+                    partition_by.append(self._parse_expression())
+                    if not self._consume_if(TokenType.COMMA):
+                        break
+            
+            # ORDER BY
+            if self._check(TokenType.ORDER):
+                self._advance()
+                self._expect(TokenType.BY)
+                order_by = []
+                while True:
+                    order_by.append(self._parse_order_by_item())
+                    if not self._consume_if(TokenType.COMMA):
+                        break
+            
+            # Frame specification
+            if self._check(TokenType.ROWS) or self._check(TokenType.RANGE) or self._check(TokenType.GROUPS):
+                frame_type = self._advance().value.upper()
+                if self._consume_if(TokenType.BETWEEN):
+                    frame_start = self._parse_frame_bound()
+                    self._expect(TokenType.AND)
+                    frame_end = self._parse_frame_bound()
+                else:
+                    frame_start = self._parse_frame_bound()
+            
+            self._expect(TokenType.RPAREN)
+            
+            definitions.append(WindowDefinition(
+                name=name_token.value,
+                partition_by=partition_by,
+                order_by=order_by,
+                frame_type=frame_type,
+                frame_start=frame_start,
+                frame_end=frame_end
+            ))
+            
+            if not self._consume_if(TokenType.COMMA):
+                break
+        
+        return definitions
     
     # ============== Parsing des expressions ==============
     
@@ -1152,7 +1318,7 @@ class SQLParser:
                 # DATE sans littéral - traiter comme identifiant
                 return Identifier(name=type_name)
         
-        # Parenthèses ou sous-requête ou lambda multi-paramètres
+        # Parenthèses ou sous-requête ou lambda multi-paramètres ou tuple
         if self._consume_if(TokenType.LPAREN):
             if self._check(TokenType.SELECT):
                 self.has_subquery = True
@@ -1166,6 +1332,17 @@ class SQLParser:
                     return self._parse_multi_param_lambda()
                 
                 expr = self._parse_expression()
+                
+                # Check for tuple: (expr, expr, ...)
+                if self._consume_if(TokenType.COMMA):
+                    elements = [expr]
+                    while True:
+                        elements.append(self._parse_expression())
+                        if not self._consume_if(TokenType.COMMA):
+                            break
+                    self._expect(TokenType.RPAREN)
+                    return RowExpression(fields=elements)
+                
                 self._expect(TokenType.RPAREN)
                 return expr
         
@@ -1293,6 +1470,16 @@ class SQLParser:
                 self._expect(TokenType.RPAREN)
                 return CastExpression(expression=expr, target_type=target_type)
             
+            # EXTRACT a une syntaxe spéciale: EXTRACT(field FROM expr)
+            if func_name == 'EXTRACT':
+                # Le champ est un mot-clé comme YEAR, MONTH, DAY, etc.
+                field_token = self._advance()
+                field = field_token.value.upper()
+                self._expect(TokenType.FROM, "Expected FROM in EXTRACT expression")
+                expr = self._parse_expression()
+                self._expect(TokenType.RPAREN)
+                return ExtractExpression(field=field, expression=expr)
+            
             if func_name.lower() in self.AGGREGATE_FUNCTIONS:
                 self.has_aggregation = True
             
@@ -1300,6 +1487,8 @@ class SQLParser:
             
             # STRUCT et ROW supportent les arguments nommés (expr AS name)
             supports_named_args = func_name in ('STRUCT', 'ROW')
+            # JSON_OBJECT supporte key: value syntax
+            supports_key_value = func_name in ('JSON_OBJECT',)
             
             args = []
             if not self._check(TokenType.RPAREN):
@@ -1309,8 +1498,12 @@ class SQLParser:
                 else:
                     while True:
                         arg = self._parse_expression()
+                        # Check for key:value syntax (JSON_OBJECT)
+                        if supports_key_value and self._consume_if(TokenType.COLON):
+                            value = self._parse_expression()
+                            arg = KeyValuePair(key=arg, value=value)
                         # Check for named argument (expr AS name)
-                        if supports_named_args and self._consume_if(TokenType.AS):
+                        elif supports_named_args and self._consume_if(TokenType.AS):
                             arg_name_token = self._expect(TokenType.IDENTIFIER, "Expected field name after AS")
                             arg = NamedArgument(expression=arg, name=arg_name_token.value)
                         args.append(arg)
@@ -1378,6 +1571,21 @@ class SQLParser:
     def _parse_window_function(self, func: FunctionCall) -> WindowFunction:
         """Parse une window function avec OVER clause."""
         self._expect(TokenType.OVER)
+        
+        # Check for window name reference (OVER window_name) vs inline spec (OVER (...))
+        if not self._check(TokenType.LPAREN):
+            # Window name reference
+            window_name = self._expect(TokenType.IDENTIFIER).value
+            return WindowFunction(
+                function=func,
+                partition_by=None,
+                order_by=None,
+                frame_type=None,
+                frame_start=None,
+                frame_end=None,
+                window_name=window_name
+            )
+        
         self._expect(TokenType.LPAREN)
         
         partition_by = None
@@ -1408,8 +1616,8 @@ class SQLParser:
                 if not self._consume_if(TokenType.COMMA):
                     break
         
-        # Frame specification: ROWS/RANGE BETWEEN ... AND ...
-        if self._check(TokenType.ROWS) or self._check(TokenType.RANGE):
+        # Frame specification: ROWS/RANGE/GROUPS BETWEEN ... AND ...
+        if self._check(TokenType.ROWS) or self._check(TokenType.RANGE) or self._check(TokenType.GROUPS):
             frame_type = self._advance().value.upper()
             
             if self._consume_if(TokenType.BETWEEN):
@@ -1419,6 +1627,16 @@ class SQLParser:
             else:
                 # Just frame start (e.g., ROWS UNBOUNDED PRECEDING)
                 frame_start = self._parse_frame_bound()
+            
+            # EXCLUDE clause (optional)
+            if self._consume_if(TokenType.EXCLUDE):
+                if self._check_keyword('CURRENT') and self._peek().value.upper() == 'ROW':
+                    self._advance()  # CURRENT
+                    self._advance()  # ROW
+                    # Store in metadata or extend WindowFunction
+                elif self._check_keyword('NO') and self._peek().value.upper() == 'OTHERS':
+                    self._advance()
+                    self._advance()
         
         self._expect(TokenType.RPAREN)
         
