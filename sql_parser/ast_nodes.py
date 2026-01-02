@@ -904,6 +904,9 @@ class SelectStatement(ASTNode):
     order_by: Optional[List[OrderByItem]] = None
     limit: Optional[Expression] = None
     offset: Optional[Expression] = None
+    top: Optional[Expression] = None  # T-SQL: SELECT TOP n
+    top_percent: bool = False  # T-SQL: SELECT TOP n PERCENT
+    top_with_ties: bool = False  # T-SQL: SELECT TOP n WITH TIES
     distinct: bool = False
     distinct_on: Optional[List[Expression]] = None  # PostgreSQL DISTINCT ON (col1, col2)
     ctes: Optional[List[CTEDefinition]] = None
@@ -925,6 +928,13 @@ class SelectStatement(ASTNode):
         
         if self.distinct_on:
             result["distinct_on"] = [expr.to_dict() for expr in self.distinct_on]
+        
+        if self.top:
+            result["top"] = self.top.to_dict()
+            if self.top_percent:
+                result["top_percent"] = True
+            if self.top_with_ties:
+                result["top_with_ties"] = True
         
         if self.metadata:
             result["metadata"] = self.metadata

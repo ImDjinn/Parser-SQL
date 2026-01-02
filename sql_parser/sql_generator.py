@@ -613,6 +613,15 @@ class SQLGenerator:
                 on_exprs = ', '.join(self._generate_node(e) for e in node.distinct_on)
                 select_parts.append(f' {self._kw("ON")} ({on_exprs})')
         
+        # TOP (T-SQL specific)
+        if node.top:
+            top_val = self._generate_node(node.top)
+            select_parts.append(f' {self._kw("TOP")} {top_val}')
+            if node.top_percent:
+                select_parts.append(f' {self._kw("PERCENT")}')
+            if node.top_with_ties:
+                select_parts.append(f' {self._kw("WITH TIES")}')
+        
         items = [self._generate_node(item) for item in node.select_items]
         if self.inline:
             select_parts.append(' ' + ', '.join(items))

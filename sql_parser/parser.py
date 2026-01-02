@@ -489,6 +489,32 @@ class SQLParser:
         elif not self._consume_if(TokenType.ALL):
             pass  # ALL est le comportement par défaut
         
+        # TOP n [PERCENT] [WITH TIES] (T-SQL)
+        top = None
+        top_percent = False
+        top_with_ties = False
+        if self._check(TokenType.TOP):
+            self._advance()
+            # Parser le nombre (peut être entre parenthèses)
+            if self._check(TokenType.LPAREN):
+                self._advance()
+                top = self._parse_expression()
+                self._expect(TokenType.RPAREN)
+            else:
+                top = self._parse_primary_expression()
+            
+            # PERCENT optionnel
+            if self._current().value and self._current().value.upper() == 'PERCENT':
+                self._advance()
+                top_percent = True
+            
+            # WITH TIES optionnel
+            if self._check(TokenType.WITH):
+                self._advance()
+                if self._current().value and self._current().value.upper() == 'TIES':
+                    self._advance()
+                    top_with_ties = True
+        
         # Liste des colonnes
         select_items = self._parse_select_items()
         
@@ -554,6 +580,9 @@ class SQLParser:
             order_by=order_by,
             limit=limit,
             offset=offset,
+            top=top,
+            top_percent=top_percent,
+            top_with_ties=top_with_ties,
             distinct=distinct,
             distinct_on=distinct_on,
             window_clause=window_clause

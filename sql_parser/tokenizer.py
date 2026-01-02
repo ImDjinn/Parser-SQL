@@ -100,6 +100,7 @@ class TokenType(Enum):
     DESC = auto()
     LIMIT = auto()
     OFFSET = auto()
+    TOP = auto()           # T-SQL: SELECT TOP n
     DISTINCT = auto()
     ALL = auto()
     
@@ -318,6 +319,7 @@ class SQLTokenizer:
         'desc': TokenType.DESC,
         'limit': TokenType.LIMIT,
         'offset': TokenType.OFFSET,
+        'top': TokenType.TOP,
         'distinct': TokenType.DISTINCT,
         'all': TokenType.ALL,
         'count': TokenType.COUNT,
