@@ -13,6 +13,7 @@ from .ast_nodes import (
     BinaryOp, UnaryOp, FunctionCall, CaseExpression, NamedArgument, KeyValuePair,
     InExpression, BetweenExpression, LikeExpression, IsNullExpression,
     ExistsExpression, SubqueryExpression, CastExpression, ExtractExpression,
+    QuantifiedComparison,
     SelectItem, TableRef, SubqueryRef, JoinClause, FromClause,
     JoinType, OrderDirection, SetOperationType, OrderByItem,
     CTEDefinition, SelectStatement, ParseInfo, ParseResult,
@@ -1179,6 +1180,21 @@ class SQLParser:
                 TokenType.GREATER_EQUAL: ">="
             }
             operator = op_map[op_token.type]
+            
+            # Check for quantified comparison: = ALL/ANY/SOME (subquery)
+            if self._match(TokenType.ALL, TokenType.ANY, TokenType.SOME):
+                quantifier = self._advance().value.upper()
+                self._expect(TokenType.LPAREN)
+                self.has_subquery = True
+                subquery = self._parse_select()
+                self._expect(TokenType.RPAREN)
+                return QuantifiedComparison(
+                    expression=left,
+                    operator=operator,
+                    quantifier=quantifier,
+                    subquery=subquery
+                )
+            
             right = self._parse_additive_expression()
             return BinaryOp(left=left, operator=operator, right=right)
         

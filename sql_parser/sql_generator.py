@@ -177,6 +177,13 @@ class SQLGenerator:
         op = self._kw(node.operator) if node.operator in ('AND', 'OR') else node.operator
         return f'({left} {op} {right})'
     
+    def _gen_QuantifiedComparison(self, node) -> str:
+        """Génère une comparaison quantifiée (x > ALL/ANY/SOME (subquery))."""
+        expr = self._generate_node(node.expression)
+        subquery = self._generate_node(node.subquery)
+        quantifier = self._kw(node.quantifier)
+        return f'({expr} {node.operator} {quantifier} ({subquery}))'
+    
     def _gen_UnaryOp(self, node: UnaryOp) -> str:
         """Génère une opération unaire."""
         operand = self._generate_node(node.operand)

@@ -219,6 +219,24 @@ class BinaryOp(Expression):
 
 
 @dataclass
+class QuantifiedComparison(Expression):
+    """Comparaison quantifiée: x > ALL(subquery), x = ANY(subquery), x = SOME(subquery)."""
+    expression: Expression
+    operator: str  # =, <>, <, >, <=, >=
+    quantifier: str  # ALL, ANY, SOME
+    subquery: 'SelectStatement'
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_type": "QuantifiedComparison",
+            "expression": self.expression.to_dict(),
+            "operator": self.operator,
+            "quantifier": self.quantifier,
+            "subquery": self.subquery.to_dict()
+        }
+
+
+@dataclass
 class UnaryOp(Expression):
     """Opération unaire (ex: NOT x, -5)."""
     operator: str
