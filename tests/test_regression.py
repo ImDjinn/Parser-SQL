@@ -861,6 +861,14 @@ class TestPrestoAthenaSpecifics:
         parser = SQLParser(dialect=SQLDialect.PRESTO)
         result = parser.parse("SELECT TRY(CAST(value AS INTEGER)) FROM data")
         assert result.statement is not None
+        assert "TRY" in result.functions_used
+    
+    def test_try_cast_expression(self):
+        """Test TRY_CAST(expr AS type) syntax."""
+        parser = SQLParser(dialect=SQLDialect.PRESTO)
+        result = parser.parse("SELECT TRY_CAST(value AS INTEGER) FROM data")
+        assert result.statement is not None
+        assert "TRY_CAST" in result.functions_used
     
     def test_if_expression(self):
         parser = SQLParser(dialect=SQLDialect.PRESTO)
@@ -1312,11 +1320,13 @@ class TestEdgeCases:
         result = parser.parse('SELECT "select", "from" FROM "table"')
         assert result.statement is not None
     
-    @pytest.mark.skip(reason="Bracket identifiers [name] not yet fully supported")
     def test_bracket_identifiers(self):
+        """Test T-SQL style bracket identifiers [column]."""
         parser = SQLParser(dialect=SQLDialect.TSQL)
         result = parser.parse("SELECT [select], [from] FROM [table]")
         assert result.statement is not None
+        assert "select" in result.columns_referenced
+        assert "table" in result.tables_referenced
     
     def test_comments_single_line(self):
         parser = SQLParser()

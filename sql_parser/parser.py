@@ -1122,7 +1122,11 @@ class SQLParser:
         if self._check(TokenType.INTERVAL):
             return self._parse_interval_expression()
         
-        # TRY() ou TRY_CAST() (Presto/Athena)
+        # TRY_CAST (Presto/Athena) - must check before TRY
+        if self._check(TokenType.TRY_CAST):
+            return self._parse_try_cast_expression()
+        
+        # TRY() (Presto/Athena)
         if self._check(TokenType.TRY):
             return self._parse_try_expression()
         
@@ -1604,18 +1608,29 @@ class SQLParser:
         
         return IntervalExpression(value=value, unit=unit)
     
-    def _parse_try_expression(self) -> Expression:
-        """Parse TRY(...) ou TRY_CAST(...) (Presto/Athena)."""
-        self._expect(TokenType.TRY)
+    def _parse_try_cast_expression(self) -> CastExpression:
+        """Parse TRY_CAST(expr AS type) (Presto/Athena)."""
+        self._expect(TokenType.TRY_CAST)
+        self._expect(TokenType.LPAREN)
         
-        # Check for TRY_CAST
-        if self._current().type == TokenType.IDENTIFIER and self._current().value.upper() == '_CAST':
-            # Actually it would be parsed as TRY identifier, need different approach
-            pass
+        self.functions_used.add("TRY_CAST")
+        
+        expr = self._parse_expression()
+        self._expect(TokenType.AS, "Expected AS in TRY_CAST expression")
+        target_type = self._parse_type_name()
+        self._expect(TokenType.RPAREN)
+        
+        return CastExpression(expression=expr, target_type=target_type, is_try_cast=True)
+    
+    def _parse_try_expression(self) -> Expression:
+        """Parse TRY(...) (Presto/Athena)."""
+        self._expect(TokenType.TRY)
         
         self._expect(TokenType.LPAREN)
         expr = self._parse_expression()
         self._expect(TokenType.RPAREN)
+        
+        self.functions_used.add("TRY")
         
         return TryExpression(expression=expr)
     

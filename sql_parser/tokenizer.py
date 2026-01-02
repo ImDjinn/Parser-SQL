@@ -141,6 +141,7 @@ class TokenType(Enum):
     BERNOULLI = auto()
     SYSTEM = auto()
     TRY = auto()
+    TRY_CAST = auto()
     ARRAY = auto()
     MAP = auto()
     ROW = auto()
@@ -338,6 +339,7 @@ class SQLTokenizer:
         'bernoulli': TokenType.BERNOULLI,
         'system': TokenType.SYSTEM,
         'try': TokenType.TRY,
+        'try_cast': TokenType.TRY_CAST,
         'array': TokenType.ARRAY,
         'map': TokenType.MAP,
         'row': TokenType.ROW,
@@ -510,6 +512,19 @@ class SQLTokenizer:
         
         return self._make_token(TokenType.QUOTED_IDENTIFIER, value, start_line, start_col, start_pos)
     
+    def _read_bracket_identifier(self) -> Token:
+        """Lit un identifiant entre crochets (style T-SQL: [identifier])."""
+        start_line, start_col, start_pos = self.line, self.column, self.pos
+        value = self._advance()  # Consomme le '['
+        
+        while self._current_char() and self._current_char() != ']':
+            value += self._advance()
+        
+        if self._current_char() == ']':
+            value += self._advance()
+        
+        return self._make_token(TokenType.QUOTED_IDENTIFIER, value, start_line, start_col, start_pos)
+    
     def _read_number(self) -> Token:
         """Lit un nombre (entier ou flottant)."""
         start_line, start_col, start_pos = self.line, self.column, self.pos
@@ -663,9 +678,25 @@ class SQLTokenizer:
                 self.tokens.append(self._read_string("'"))
                 continue
             
-            # Identifiants entre guillemets
+            # Identifiants entre guillemets ou crochets (T-SQL: [identifier])
             if char == '"' or char == '`':
                 self.tokens.append(self._read_quoted_identifier())
+                continue
+            
+            # Identifiants entre crochets (T-SQL style) ou subscript (ARRAY[...])
+            # Si le token précédent est ARRAY, MAP, ou un identifiant, c'est un subscript
+            if char == '[':
+                # Check if this is an array subscript or a T-SQL identifier
+                last_token = self.tokens[-1] if self.tokens else None
+                if last_token and last_token.type in (
+                    TokenType.ARRAY, TokenType.MAP, TokenType.IDENTIFIER,
+                    TokenType.QUOTED_IDENTIFIER, TokenType.RBRACKET, TokenType.RPAREN
+                ):
+                    # This is a subscript like ARRAY[...] or arr[0]
+                    self.tokens.append(self._read_operator_or_punctuation())
+                else:
+                    # This is a T-SQL bracket identifier like [Column Name]
+                    self.tokens.append(self._read_bracket_identifier())
                 continue
             
             # Nombres
